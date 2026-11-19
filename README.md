@@ -1,5 +1,6 @@
 # E-Library 電子圖書館服務
 
+[![CI](https://github.com/ChovyCao2025/e-library-service/actions/workflows/ci.yml/badge.svg)](https://github.com/ChovyCao2025/e-library-service/actions/workflows/ci.yml)
 ![Java](https://img.shields.io/badge/Java-21-ED8B00)
 ![Spring Boot](https://img.shields.io/badge/Spring%20Boot-4.0.9-6DB33F)
 ![MySQL](https://img.shields.io/badge/MySQL-8.4-4479A1)
