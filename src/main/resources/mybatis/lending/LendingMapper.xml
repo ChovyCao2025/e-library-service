@@ -1,0 +1,297 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.elibrary.lending.infrastructure.LendingMapper">
+  <!-- 顯式欄位清單依 Java Record 建構參數排序，資料表新增欄位不會改變映射結果。 -->
+  <sql id="projectionColumns">
+    resource_type, resource_id, generation, state, owner_token, lease_until, updated_at
+  </sql>
+
+  <sql id="borrowRequestColumns">
+    request_id, user_id, idem_key, book_id, request_hash, loan_id, status, attempt,
+    attempt_token, admission_mode, quota_generation, stock_generation, lease_until,
+    quota_settled, stock_settled, result_code, created_at, updated_at
+  </sql>
+
+  <sql id="loanColumns">
+    loan_id, request_id, user_id, book_id, idem_key, status, active_key, borrowed_at,
+    due_at, returned_at, return_reason, policy_version, version, created_at, updated_at
+  </sql>
+
+  <!-- 帳戶與投影控制。共享鎖服務 Redis 路徑，排他鎖服務 DB_ONLY 與重建路徑。 -->
+  <insert id="ensureAccount">
+    INSERT IGNORE INTO user_lending_account(user_id, active_count, version, updated_at)
+    VALUES (#{userId}, 0, 0, #{now})
+  </insert>
+
+  <insert id="ensureUserProjection">
+    INSERT IGNORE INTO projection_control(
+      resource_type, resource_id, generation, state, updated_at
+    ) VALUES ('USER', #{userId}, 1, 'DIRTY', #{now})
+  </insert>
+
+  <select id="findProjection" resultType="com.elibrary.lending.infrastructure.ProjectionControlRow">
+    SELECT <include refid="projectionColumns"/>
+    FROM projection_control
+    WHERE resource_type = #{type} AND resource_id = #{id}
+  </select>
+
+  <select id="lockProjectionShare" resultType="com.elibrary.lending.infrastructure.ProjectionControlRow">
+    SELECT <include refid="projectionColumns"/>
+    FROM projection_control
+    WHERE resource_type = #{type} AND resource_id = #{id}
+    FOR SHARE
+  </select>
+
+  <select id="lockProjectionUpdate" resultType="com.elibrary.lending.infrastructure.ProjectionControlRow">
+    SELECT <include refid="projectionColumns"/>
+    FROM projection_control
+    WHERE resource_type = #{type} AND resource_id = #{id}
+    FOR UPDATE
+  </select>
+
+  <update id="markDirtyFromReady">
+    UPDATE projection_control
+    SET generation = generation + 1, state = 'DIRTY', owner_token = NULL,
+        lease_until = NULL, updated_at = #{now}
+    WHERE resource_type = #{type} AND resource_id = #{id} AND state = 'READY'
+  </update>
+
+  <!-- 持久化冪等臺帳；attempt_token 用於隔離逾期或延遲的處理者。 -->
+  <select id="findRequest" resultType="com.elibrary.lending.infrastructure.BorrowRequestRow">
+    SELECT <include refid="borrowRequestColumns"/>
+    FROM borrow_request
+    WHERE user_id = #{userId} AND idem_key = #{idemKey}
+  </select>
+
+  <select id="findRequestById" resultType="com.elibrary.lending.infrastructure.BorrowRequestRow">
+    SELECT <include refid="borrowRequestColumns"/>
+    FROM borrow_request
+    WHERE request_id = #{requestId} AND user_id = #{userId}
+  </select>
+
+  <select id="lockRequest" resultType="com.elibrary.lending.infrastructure.BorrowRequestRow">
+    SELECT <include refid="borrowRequestColumns"/>
+    FROM borrow_request
+    WHERE request_id = #{requestId}
+    FOR UPDATE
+  </select>
+
+  <insert id="insertRequest">
+    INSERT IGNORE INTO borrow_request(
+      request_id, user_id, idem_key, book_id, request_hash, loan_id, status, attempt,
+      attempt_token, admission_mode, quota_generation, stock_generation, lease_until,
+      quota_settled, stock_settled, created_at, updated_at
+    ) VALUES (
+      #{requestId}, #{userId}, #{idemKey}, #{bookId}, #{requestHash}, #{loanId},
+      'PROCESSING', 1, #{attemptToken}, #{mode}, #{quotaGeneration}, #{stockGeneration},
+      #{leaseUntil}, 0, 0, #{now}, #{now}
+    )
+  </insert>
+
+  <update id="restartRequest">
+    UPDATE borrow_request
+    SET status = 'PROCESSING', attempt = attempt + 1, attempt_token = #{token},
+        admission_mode = #{mode}, quota_generation = #{quotaGeneration},
+        stock_generation = #{stockGeneration}, lease_until = #{leaseUntil},
+        quota_settled = 0, stock_settled = 0, result_code = NULL, updated_at = #{now}
+    WHERE request_id = #{requestId} AND status = 'RETRYABLE'
+  </update>
+
+  <update id="markRequestSucceeded">
+    UPDATE borrow_request
+    SET status = 'SUCCEEDED', result_code = 'SUCCEEDED', quota_settled = #{settled},
+        stock_settled = #{settled}, updated_at = #{now}
+    WHERE request_id = #{requestId} AND status = 'PROCESSING' AND attempt_token = #{token}
+  </update>
+
+  <update id="markReleasing">
+    UPDATE borrow_request
+    SET status = 'RELEASING', result_code = #{resultCode}, updated_at = #{now}
+    WHERE request_id = #{requestId} AND status = 'PROCESSING' AND attempt_token = #{token}
+  </update>
+
+  <update id="markRetryable">
+    UPDATE borrow_request
+    SET status = 'RETRYABLE', quota_settled = 1, stock_settled = 1, updated_at = #{now}
+    WHERE request_id = #{requestId} AND status = 'RELEASING' AND attempt_token = #{token}
+  </update>
+
+  <update id="settleQuota">
+    UPDATE borrow_request
+    SET quota_settled = 1, updated_at = #{now}
+    WHERE request_id = #{requestId} AND attempt_token = #{token}
+  </update>
+
+  <update id="settleStock">
+    UPDATE borrow_request
+    SET stock_settled = 1, updated_at = #{now}
+    WHERE request_id = #{requestId} AND attempt_token = #{token}
+  </update>
+
+  <!-- 權威配額與庫存採條件更新，影響行數就是不變量檢查結果。 -->
+  <select id="lockAccount" resultType="integer">
+    SELECT active_count
+    FROM user_lending_account
+    WHERE user_id = #{userId}
+    FOR UPDATE
+  </select>
+
+  <update id="occupyQuota">
+    UPDATE user_lending_account
+    SET active_count = active_count + 1, version = version + 1, updated_at = #{now}
+    WHERE user_id = #{userId} AND active_count &lt; #{maxActive}
+  </update>
+
+  <update id="releaseQuota">
+    UPDATE user_lending_account
+    SET active_count = active_count - 1, version = version + 1, updated_at = #{now}
+    WHERE user_id = #{userId} AND active_count &gt; 0
+  </update>
+
+  <select id="lockStock" resultType="integer">
+    SELECT available_copies
+    FROM lending_stock
+    WHERE book_id = #{bookId}
+    FOR UPDATE
+  </select>
+
+  <update id="occupyStock">
+    UPDATE lending_stock
+    SET available_copies = available_copies - 1, version = version + 1, updated_at = #{now}
+    WHERE book_id = #{bookId} AND available_copies &gt; 0
+  </update>
+
+  <update id="releaseStock">
+    UPDATE lending_stock
+    SET available_copies = available_copies + 1, version = version + 1, updated_at = #{now}
+    WHERE book_id = #{bookId} AND available_copies &lt; total_copies
+  </update>
+
+  <select id="stockVersion" resultType="long">
+    SELECT version FROM lending_stock WHERE book_id = #{bookId}
+  </select>
+
+  <select id="accountVersion" resultType="long">
+    SELECT version FROM user_lending_account WHERE user_id = #{userId}
+  </select>
+
+  <!-- 借閱生命週期。資料庫唯一鍵負責處理最後一層併發競爭。 -->
+  <insert id="insertLoan">
+    INSERT INTO loan(
+      loan_id, request_id, user_id, book_id, idem_key, status, borrowed_at, due_at,
+      policy_version, version, created_at, updated_at
+    ) VALUES (
+      #{loanId}, #{requestId}, #{userId}, #{bookId}, #{idemKey}, 'BORROWED',
+      #{borrowedAt}, #{dueAt}, #{policyVersion}, 0, #{borrowedAt}, #{borrowedAt}
+    )
+  </insert>
+
+  <select id="findLoan" resultType="com.elibrary.lending.infrastructure.LoanRow">
+    SELECT <include refid="loanColumns"/>
+    FROM loan
+    WHERE loan_id = #{loanId} AND user_id = #{userId}
+  </select>
+
+  <select id="lockLoan" resultType="com.elibrary.lending.infrastructure.LoanRow">
+    SELECT <include refid="loanColumns"/>
+    FROM loan
+    WHERE loan_id = #{loanId} AND user_id = #{userId}
+    FOR UPDATE
+  </select>
+
+  <select id="findLoanByRequest" resultType="com.elibrary.lending.infrastructure.LoanRow">
+    SELECT <include refid="loanColumns"/>
+    FROM loan
+    WHERE request_id = #{requestId}
+  </select>
+
+  <update id="returnLoan">
+    UPDATE loan
+    SET status = 'RETURNED', returned_at = #{now}, return_reason = #{reason},
+        version = version + 1, updated_at = #{now}
+    WHERE loan_id = #{loanId} AND user_id = #{userId} AND status = 'BORROWED'
+  </update>
+
+  <select id="listLoans" resultType="com.elibrary.lending.infrastructure.LoanRow">
+    SELECT <include refid="loanColumns"/>
+    FROM loan
+    WHERE user_id = #{userId} AND status = #{status}
+    <if test="afterTime != null">
+      AND (borrowed_at &lt; #{afterTime}
+        OR (borrowed_at = #{afterTime} AND loan_id &lt; #{afterId}))
+    </if>
+    ORDER BY borrowed_at DESC, loan_id DESC
+    LIMIT #{limit}
+  </select>
+
+  <select id="findExpired" resultType="com.elibrary.lending.infrastructure.LoanRow">
+    SELECT <include refid="loanColumns"/>
+    FROM loan
+    WHERE status = 'BORROWED' AND due_at &lt;= #{now}
+    ORDER BY due_at, loan_id
+    LIMIT #{limit}
+  </select>
+
+  <select id="findRequestsForRecovery" resultType="com.elibrary.lending.infrastructure.BorrowRequestRow">
+    SELECT <include refid="borrowRequestColumns"/>
+    FROM borrow_request
+    WHERE (status = 'PROCESSING' AND lease_until &lt; #{now})
+       OR status = 'RELEASING'
+       OR (status = 'SUCCEEDED' AND (quota_settled = 0 OR stock_settled = 0))
+    ORDER BY request_id
+    LIMIT #{limit}
+  </select>
+
+  <!-- Redis 投影重建使用租約認領，完成時以 generation 與 owner 進行 CAS。 -->
+  <select id="accountCount" resultType="integer">
+    SELECT active_count FROM user_lending_account WHERE user_id = #{userId}
+  </select>
+
+  <select id="stockTotal" resultType="integer">
+    SELECT total_copies FROM lending_stock WHERE book_id = #{bookId}
+  </select>
+
+  <select id="stockAvailable" resultType="integer">
+    SELECT available_copies FROM lending_stock WHERE book_id = #{bookId}
+  </select>
+
+  <select id="activeLoansForUser" resultType="com.elibrary.lending.infrastructure.LoanRow">
+    SELECT <include refid="loanColumns"/>
+    FROM loan
+    WHERE user_id = #{userId} AND status = 'BORROWED'
+    ORDER BY loan_id
+  </select>
+
+  <select id="activeLoansForBook" resultType="com.elibrary.lending.infrastructure.LoanRow">
+    SELECT <include refid="loanColumns"/>
+    FROM loan
+    WHERE book_id = #{bookId} AND status = 'BORROWED'
+    ORDER BY loan_id
+  </select>
+
+  <select id="findRebuildCandidates" resultType="com.elibrary.lending.infrastructure.ProjectionControlRow">
+    SELECT <include refid="projectionColumns"/>
+    FROM projection_control
+    WHERE state = 'DIRTY'
+       OR (state = 'REBUILDING' AND (lease_until IS NULL OR lease_until &lt; #{now}))
+    ORDER BY updated_at
+    LIMIT #{limit}
+  </select>
+
+  <update id="claimRebuild">
+    UPDATE projection_control
+    SET generation = CASE WHEN state = 'DIRTY' THEN generation + 1 ELSE generation END,
+        state = 'REBUILDING', owner_token = #{owner}, lease_until = #{leaseUntil},
+        updated_at = #{now}
+    WHERE resource_type = #{type} AND resource_id = #{id}
+      AND (state = 'DIRTY'
+        OR (state = 'REBUILDING' AND (lease_until IS NULL OR lease_until &lt; #{now})))
+  </update>
+
+  <update id="completeRebuild">
+    UPDATE projection_control
+    SET state = 'READY', owner_token = NULL, lease_until = NULL, updated_at = #{now}
+    WHERE resource_type = #{type} AND resource_id = #{id} AND generation = #{generation}
+      AND state = 'REBUILDING' AND owner_token = #{owner}
+  </update>
+</mapper>

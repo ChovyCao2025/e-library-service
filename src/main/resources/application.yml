@@ -1,0 +1,80 @@
+spring:
+  application:
+    name: e-library
+  datasource:
+    url: ${DB_URL:jdbc:mysql://localhost:3306/elibrary?useUnicode=true&characterEncoding=utf8&connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true}
+    username: ${DB_USERNAME:elibrary}
+    password: ${DB_PASSWORD:elibrary}
+    hikari:
+      maximum-pool-size: ${DB_POOL_SIZE:40}
+      connection-timeout: 2000
+  flyway:
+    enabled: true
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      timeout: 100ms
+  cache:
+    type: caffeine
+    caffeine:
+      spec: maximumSize=10000,expireAfterWrite=5s
+  jackson:
+    default-property-inclusion: non_null
+  mvc:
+    problemdetails:
+      enabled: false
+
+mybatis:
+  mapper-locations: classpath*:/mybatis/**/*.xml
+  configuration:
+    map-underscore-to-camel-case: true
+    default-statement-timeout: 3
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  health:
+    redis:
+      enabled: ${LENDING_REDIS_ENABLED:true}
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+
+app:
+  role: ${APP_ROLE:all}
+  auth:
+    dev-mode: ${DEV_AUTH_ENABLED:true}
+    default-user-id: ${DEV_USER_ID:10001}
+    default-role: ${DEV_USER_ROLE:USER}
+  lending:
+    max-active-loans: ${MAX_ACTIVE_LOANS:5}
+    loan-days: ${LOAN_DAYS:14}
+    policy-version: ${LOAN_POLICY_VERSION:v1}
+    attempt-lease: 30s
+    recovery-interval: 10s
+    expiry-interval: 30s
+    expiry-batch: 500
+    redis-enabled: ${LENDING_REDIS_ENABLED:true}
+    db-only-on-redis-failure: ${DB_ONLY_ON_REDIS_FAILURE:true}
+  outbox:
+    interval: 200ms
+    batch-size: 200
+    lease: 30s
+    rocketmq-enabled: ${ROCKETMQ_ENABLED:false}
+    endpoints: ${ROCKETMQ_ENDPOINTS:localhost:8081}
+  cursor:
+    secret: ${CURSOR_SECRET:change-me-in-production-32-bytes-min}
+    ttl: 60s
+
+server:
+  shutdown: graceful
+  error:
+    include-message: never

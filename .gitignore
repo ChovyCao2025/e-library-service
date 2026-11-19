@@ -1,0 +1,19 @@
+# Build output
+/target/
+*.class
+*.log
+hs_err_pid*
+
+# Local tools and IDE state
+/.tools/
+/.idea/
+/.vscode/
+*.iml
+
+# Local configuration and generated reports
+.env
+!.env.example
+dependency-tree.txt
+
+# The original assignment may have redistribution restrictions.
+/docs/design/*.pdf

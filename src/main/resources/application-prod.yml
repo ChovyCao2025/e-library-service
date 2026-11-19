@@ -1,0 +1,6 @@
+app:
+  auth:
+    dev-mode: false
+springdoc:
+  swagger-ui:
+    enabled: false
