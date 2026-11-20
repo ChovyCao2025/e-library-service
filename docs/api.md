@@ -10,6 +10,17 @@
 - 開發模式預設使用者為 `10001 / USER`。
 - 可用 `X-User-Id` 與 `X-Role` 模擬受信任閘道身分。
 
+### 回應模型
+
+成功回應直接回傳具型別的資源 DTO，並使用 HTTP 狀態碼與標頭表達結果，例如：
+
+- 建立借閱使用 `201 Created` 與 `Location`。
+- 冪等重放使用 `200 OK` 與 `Idempotent-Replay: true`。
+- 游標分頁 DTO 統一包含 `items`、`nextCursor` 與 `hasMore`。
+
+錯誤回應統一使用 `ProblemResponse` 與 `application/problem+json`。本專案刻意不增加
+`code/message/data` 成功包裝層，避免重複 HTTP 狀態語義，並保留快取、Location 與不同資源模型的表達能力。
+
 ## 書目 API
 
 ### 瀏覽書籍
