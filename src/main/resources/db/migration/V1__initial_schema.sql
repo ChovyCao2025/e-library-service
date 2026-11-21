@@ -3,7 +3,6 @@ CREATE TABLE category (
   name VARCHAR(50) NOT NULL,
   parent_id BIGINT UNSIGNED NOT NULL DEFAULT 0
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
 CREATE TABLE book (
   book_id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
   isbn VARCHAR(20) NULL,
@@ -46,44 +45,13 @@ CREATE TABLE user_lending_account (
   CONSTRAINT ck_account_count CHECK (active_count >= 0)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-CREATE TABLE projection_control (
-  resource_type VARCHAR(4) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
-  resource_id BIGINT UNSIGNED NOT NULL,
-  generation BIGINT NOT NULL DEFAULT 1,
-  state VARCHAR(12) NOT NULL DEFAULT 'REBUILDING',
-  owner_token VARCHAR(80) NULL,
-  lease_until DATETIME(3) NULL,
-  updated_at DATETIME(3) NOT NULL,
-  PRIMARY KEY (resource_type, resource_id),
-  KEY idx_projection_rebuild (state, lease_until),
-  CONSTRAINT ck_projection_type CHECK (resource_type IN ('BOOK','USER')),
-  CONSTRAINT ck_projection_state CHECK (state IN ('READY','DIRTY','REBUILDING'))
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
 CREATE TABLE borrow_request (
   request_id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
   user_id BIGINT UNSIGNED NOT NULL,
   idem_key VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
   book_id BIGINT UNSIGNED NOT NULL,
-  request_hash CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
-  loan_id BIGINT UNSIGNED NOT NULL,
-  status VARCHAR(12) NOT NULL,
-  attempt INT NOT NULL DEFAULT 1,
-  attempt_token VARCHAR(80) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
-  admission_mode VARCHAR(8) NOT NULL DEFAULT 'REDIS',
-  quota_generation BIGINT NULL,
-  stock_generation BIGINT NULL,
-  lease_until DATETIME(3) NOT NULL,
-  quota_settled TINYINT NOT NULL DEFAULT 0,
-  stock_settled TINYINT NOT NULL DEFAULT 0,
-  result_code VARCHAR(64) NULL,
   created_at DATETIME(3) NOT NULL,
-  updated_at DATETIME(3) NOT NULL,
-  UNIQUE KEY uk_request_user_idem (user_id, idem_key),
-  UNIQUE KEY uk_request_loan (loan_id),
-  KEY idx_request_recovery (status, lease_until, request_id),
-  CONSTRAINT ck_admission_mode CHECK (admission_mode IN ('REDIS','DB_ONLY')),
-  CONSTRAINT ck_request_status CHECK (status IN ('PROCESSING','SUCCEEDED','RELEASING','RETRYABLE'))
+  UNIQUE KEY uk_request_user_idem (user_id, idem_key)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE loan (
@@ -91,7 +59,6 @@ CREATE TABLE loan (
   request_id BIGINT UNSIGNED NOT NULL,
   user_id BIGINT UNSIGNED NOT NULL,
   book_id BIGINT UNSIGNED NOT NULL,
-  idem_key VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
   status VARCHAR(10) NOT NULL,
   active_key TINYINT GENERATED ALWAYS AS (CASE WHEN status = 'BORROWED' THEN 1 ELSE NULL END) STORED,
   borrowed_at DATETIME(3) NOT NULL,
@@ -103,9 +70,8 @@ CREATE TABLE loan (
   created_at DATETIME(3) NOT NULL,
   updated_at DATETIME(3) NOT NULL,
   UNIQUE KEY uk_loan_request (request_id),
-  UNIQUE KEY uk_user_idem (user_id, idem_key),
   UNIQUE KEY uk_user_book_active (user_id, book_id, active_key),
-  KEY idx_user_status_time (user_id, status, borrowed_at, loan_id),
+  KEY idx_user_status_id (user_id, status, loan_id),
   KEY idx_book_active (book_id, active_key, loan_id),
   KEY idx_status_due (status, due_at, loan_id),
   CONSTRAINT ck_loan_status CHECK (status IN ('BORROWED','RETURNED')),
@@ -129,54 +95,11 @@ CREATE TABLE outbox_event (
   sent_at DATETIME(3) NULL,
   last_error VARCHAR(1000) NULL,
   KEY idx_outbox_ready (status, next_attempt_at, id),
-  KEY idx_outbox_lease (status, lease_until, id)
+  KEY idx_outbox_lease (status, lease_until, id),
+  CONSTRAINT ck_outbox_aggregate_type CHECK (aggregate_type IN ('Book','Loan','LendingStock')),
+  CONSTRAINT ck_outbox_event_type CHECK (event_type IN (
+    'BookCreated','BookUpdated','BookPublished','BookOfflined',
+    'BookBorrowed','BookReturned','StockResized'
+  )),
+  CONSTRAINT ck_outbox_status CHECK (status IN ('NEW','CLAIMED','SENT'))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
-CREATE TABLE consumer_receipt (
-  consumer_group VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
-  target_key VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
-  event_id BIGINT UNSIGNED NOT NULL,
-  status VARCHAR(16) NOT NULL,
-  attempts INT NOT NULL DEFAULT 0,
-  last_error VARCHAR(1000) NULL,
-  applied_at DATETIME(3) NULL,
-  updated_at DATETIME(3) NOT NULL,
-  PRIMARY KEY (consumer_group, target_key, event_id),
-  KEY idx_receipt_status (status, updated_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
-CREATE TABLE catalog_write_gate (
-  id TINYINT NOT NULL PRIMARY KEY,
-  state VARCHAR(8) NOT NULL,
-  owner_token VARCHAR(80) NULL,
-  updated_at DATETIME(3) NOT NULL
-) ENGINE=InnoDB;
-
-CREATE TABLE search_generation (
-  index_name VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL PRIMARY KEY,
-  state VARCHAR(12) NOT NULL,
-  created_at DATETIME(3) NOT NULL,
-  updated_at DATETIME(3) NOT NULL
-) ENGINE=InnoDB;
-
-CREATE TABLE search_delivery (
-  event_id BIGINT UNSIGNED NOT NULL,
-  index_name VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
-  status VARCHAR(16) NOT NULL DEFAULT 'PENDING',
-  updated_at DATETIME(3) NOT NULL,
-  PRIMARY KEY (event_id, index_name),
-  KEY idx_search_pending (index_name, status, event_id)
-) ENGINE=InnoDB;
-
-CREATE TABLE search_reindex_job (
-  job_id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
-  target_index VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
-  state VARCHAR(16) NOT NULL,
-  owner_token VARCHAR(80) NULL,
-  lease_until DATETIME(3) NULL,
-  scan_after BIGINT UNSIGNED NULL,
-  last_error VARCHAR(1000) NULL,
-  created_at DATETIME(3) NOT NULL,
-  updated_at DATETIME(3) NOT NULL,
-  KEY idx_reindex_state (state, lease_until)
-) ENGINE=InnoDB;

@@ -2,17 +2,21 @@ package com.elibrary.lending.application;
 
 import com.elibrary.catalog.infrastructure.BookRow;
 import com.elibrary.catalog.infrastructure.CatalogMapper;
-import com.elibrary.lending.infrastructure.BorrowRequestRow;
+import com.elibrary.lending.domain.LoanStatus;
+import com.elibrary.lending.domain.ReturnReason;
 import com.elibrary.lending.infrastructure.LendingMapper;
 import com.elibrary.lending.infrastructure.LoanRow;
-import com.elibrary.lending.infrastructure.ProjectionControlRow;
 import com.elibrary.shared.kernel.AppProperties;
 import com.elibrary.shared.kernel.ClockProvider;
-import com.elibrary.shared.outbox.OutboxWriter;
-import com.elibrary.shared.web.DomainException;
-import com.elibrary.shared.web.ErrorCode;
+import com.elibrary.shared.kernel.SnowflakeIdGenerator;
+import com.elibrary.shared.outbox.application.OutboxWriter;
+import com.elibrary.shared.outbox.domain.AggregateType;
+import com.elibrary.shared.outbox.domain.DomainEventType;
+import com.elibrary.shared.web.api.ErrorCode;
+import com.elibrary.shared.web.error.DomainException;
+import lombok.Getter;
+import lombok.RequiredArgsConstructor;
 import org.springframework.dao.DuplicateKeyException;
-import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -21,178 +25,171 @@ import java.time.ZoneOffset;
 import java.util.LinkedHashMap;
 
 /**
- * 承載借閱與歸還的權威 MySQL 交易。交易方法放在獨立 Spring Bean，
- * 確保每次呼叫都會經過 Spring 交易代理。
+ * 承载借阅与归还的权威 MySQL 交易。库存、使用者配额、Loan、幂等结果与
+ * Outbox 事件共同提交，任何一步失败都会回滚整笔业务异动。
  */
 @Service
 public class LendingTransactions {
     private final LendingMapper mapper;
     private final CatalogMapper catalog;
     private final OutboxWriter outbox;
+    private final SnowflakeIdGenerator idGenerator;
     private final ClockProvider clock;
     private final AppProperties.Lending properties;
 
     public LendingTransactions(LendingMapper mapper, CatalogMapper catalog, OutboxWriter outbox,
-                               ClockProvider clock, AppProperties appProperties) {
+                               SnowflakeIdGenerator idGenerator, ClockProvider clock,
+                               AppProperties appProperties) {
         this.mapper = mapper;
         this.catalog = catalog;
         this.outbox = outbox;
+        this.idGenerator = idGenerator;
         this.clock = clock;
-        this.properties = appProperties.lending();
+        this.properties = appProperties.getLending();
     }
 
+    /**
+     * 在单一交易内取得幂等请求所有权、锁定帐户与库存、建立 Loan 并写入事件。
+     * MySQL 条件更新与唯一键共同保护配额、库存及同书重复借阅不变量。
+     */
     @Transactional(timeout = 3)
-    public LoanRow finalizeBorrow(long requestId, String token) {
+    public BorrowResult borrow(long userId, long bookId, String idemKey) {
+        long requestId = idGenerator.nextId();
         var now = nowDb();
 
-        // 固定鎖順序：請求 -> 使用者投影 -> 帳戶 -> 書目 -> 書籍投影 -> 庫存。
-        BorrowRequestRow request = mapper.lockRequest(requestId);
-        if (request == null || !"PROCESSING".equals(request.status()) || !token.equals(request.attemptToken())
-                || !request.leaseUntil().isAfter(now)) {
-            throw new DomainException(ErrorCode.REQUEST_IN_PROGRESS, HttpStatus.CONFLICT,
-                    "Borrow attempt is no longer valid", true, requestId);
+        // 请求与 Loan 位于同一交易；后续失败时此列会一并回滚。
+        // 唯一键 (user_id, idem_key) 是幂等与并发的唯一裁决点。
+        int inserted = mapper.insertRequest(requestId, userId, idemKey, bookId, now);
+        if (inserted == 0) {
+            // 插入冲突时一次取得已提交的 Loan，不占用新的配额或库存。
+            LoanRow existing = mapper.findLoanByIdempotencyKey(userId, idemKey);
+            if (existing == null) {
+                throw new IllegalStateException("Unable to resolve duplicate borrow request");
+            }
+            return replay(existing, bookId);
         }
-        boolean dbOnly = "DB_ONLY".equals(request.admissionMode());
-        ProjectionControlRow userProjection = lockProjection("USER", request.userId(), dbOnly);
-        requireProjection(userProjection, request.quotaGeneration(), dbOnly);
-        mapper.lockAccount(request.userId());
-        BookRow book = catalog.lockSnapshot(request.bookId());
+        long loanId = idGenerator.nextId();
+
+        // 固定锁顺序：使用者帐户 -> 书目 -> 书籍库存；归还沿用相同顺序。
+        mapper.ensureAccount(userId, now);
+        if (mapper.lockAccount(userId) == null) {
+            throw new IllegalStateException("Lending account is missing for user " + userId);
+        }
+        BookRow book = catalog.lockSnapshot(bookId);
         if (book == null) {
-            throw DomainException.notFound(ErrorCode.BOOK_NOT_FOUND, "Book was not found");
+            throw DomainException.of(ErrorCode.BOOK_NOT_FOUND);
         }
-        ProjectionControlRow bookProjection = lockProjection("BOOK", request.bookId(), dbOnly);
-        requireProjection(bookProjection, request.stockGeneration(), dbOnly);
-        mapper.lockStock(request.bookId());
+        if (mapper.lockStock(bookId) == null) {
+            throw new IllegalStateException("Lending stock is missing for book " + bookId);
+        }
+        if (!book.getStatus().isBorrowable()) {
+            throw DomainException.of(ErrorCode.BOOK_NOT_BORROWABLE);
+        }
 
-        if (!"PUBLISHED".equals(book.status())) {
-            throw DomainException.conflict(ErrorCode.BOOK_NOT_BORROWABLE, "Book is not published");
+        // 影响行数就是不变量判断结果；后续失败会由交易回滚先前计数更新。
+        if (mapper.occupyQuota(userId, properties.getMaxActiveLoans(), now) != 1) {
+            throw DomainException.of(ErrorCode.LOAN_LIMIT_EXCEEDED);
         }
-        if (dbOnly) {
-            // DB_ONLY 寫入會推進 READY 代次，使舊 Redis 命名空間失去提交資格。
-            mapper.markDirtyFromReady("USER", request.userId(), now);
-            mapper.markDirtyFromReady("BOOK", request.bookId(), now);
+        if (mapper.occupyStock(bookId, now) != 1) {
+            throw DomainException.of(ErrorCode.BOOK_SOLD_OUT);
         }
-        long eventQuotaGeneration = userProjection.generation()
-                + (dbOnly && "READY".equals(userProjection.state()) ? 1 : 0);
-        long eventStockGeneration = bookProjection.generation()
-                + (dbOnly && "READY".equals(bookProjection.state()) ? 1 : 0);
-        if (mapper.occupyQuota(request.userId(), properties.maxActiveLoans(), now) != 1) {
-            throw DomainException.conflict(ErrorCode.LOAN_LIMIT_EXCEEDED, "Active loan limit reached");
-        }
-        if (mapper.occupyStock(request.bookId(), now) != 1) {
-            throw DomainException.conflict(ErrorCode.BOOK_SOLD_OUT, "No lending seat is available");
-        }
+
+        LoanRow loan = LoanRow.borrowed(loanId, requestId, userId, bookId, now,
+                now.plusDays(properties.getLoanDays()), properties.getPolicyVersion());
         try {
-            // 活躍借閱唯一鍵是防止同一使用者重複借閱同一本書的最後一道併發保護。
-            mapper.insertLoan(request.loanId(), request.requestId(), request.userId(), request.bookId(),
-                    request.idemKey(), now, now.plusDays(properties.loanDays()), properties.policyVersion());
+            // uk_user_book_active 是同一使用者重复借阅同一本书的最后一道并发保护。
+            mapper.insertLoan(loan);
         } catch (DuplicateKeyException exception) {
-            throw DomainException.conflict(ErrorCode.ALREADY_BORROWED, "User already has an active loan for this book");
+            throw DomainException.of(ErrorCode.ALREADY_BORROWED);
         }
-        if (mapper.markRequestSucceeded(requestId, token, dbOnly, now) != 1) {
-            throw new IllegalStateException("Borrow request state changed during transaction");
-        }
-        LoanRow loan = mapper.findLoanByRequest(requestId);
         var payload = loanPayload(loan);
-        payload.put("quotaGeneration", eventQuotaGeneration);
-        payload.put("stockGeneration", eventStockGeneration);
-        payload.put("accountVersion", mapper.accountVersion(request.userId()));
-        payload.put("stockVersion", mapper.stockVersion(request.bookId()));
-
-        // 業務事件與聚合資料異動在同一筆交易內寫入。
-        outbox.append("Loan", loan.loanId(), "BookBorrowed", loan.version(), payload, false);
-        return loan;
+        payload.put("accountVersion", mapper.accountVersion(userId));
+        payload.put("stockVersion", mapper.stockVersion(bookId));
+        outbox.append(AggregateType.LOAN, loan.getLoanId(), DomainEventType.BOOK_BORROWED,
+                loan.getVersion(), payload);
+        return new BorrowResult(loan, false);
     }
 
+    /**
+     * 在单一交易内完成幂等归还，只有 Loan 首次由 BORROWED 转为 RETURNED 时
+     * 才释放使用者配额与书籍库存。
+     */
     @Transactional(timeout = 3)
-    public ReturnResult returnLoan(long userId, long loanId, String reason, boolean redisMode) {
+    public LoanRow returnLoan(long userId, long loanId, ReturnReason reason) {
         LoanRow preview = mapper.findLoan(loanId, userId);
         if (preview == null) {
-            throw DomainException.notFound(ErrorCode.LOAN_NOT_FOUND, "Loan was not found");
+            throw DomainException.of(ErrorCode.LOAN_NOT_FOUND);
+        }
+        if (preview.getStatus() != LoanStatus.BORROWED) {
+            return preview;
         }
         var now = nowDb();
 
-        // 歸還沿用借閱的資源鎖順序，避免借閱與歸還形成死鎖循環。
-        ProjectionControlRow userProjection = lockProjection("USER", userId, !redisMode);
-        requireReturnProjection(userProjection, redisMode);
-        mapper.lockAccount(userId);
-        BookRow book = catalog.lockSnapshot(preview.bookId());
+        // 使用与借阅一致的锁顺序，避免借阅与归还形成反向等待。
+        if (mapper.lockAccount(userId) == null) {
+            throw new IllegalStateException("Lending account is missing for user " + userId);
+        }
+        BookRow book = catalog.lockSnapshot(preview.getBookId());
         if (book == null) {
             throw new IllegalStateException("Loan references missing book");
         }
-        ProjectionControlRow bookProjection = lockProjection("BOOK", preview.bookId(), !redisMode);
-        requireReturnProjection(bookProjection, redisMode);
-        mapper.lockStock(preview.bookId());
+        if (mapper.lockStock(preview.getBookId()) == null) {
+            throw new IllegalStateException("Loan references missing lending stock");
+        }
         LoanRow locked = mapper.lockLoan(loanId, userId);
-        if (!"BORROWED".equals(locked.status())) {
-            return new ReturnResult(locked, userProjection.generation(), bookProjection.generation(), false);
+        if (locked.getStatus() != LoanStatus.BORROWED) {
+            return locked;
         }
-        if (!redisMode) {
-            // DB_ONLY 歸還會先使 READY 投影失效，再修改權威計數。
-            mapper.markDirtyFromReady("USER", userId, now);
-            mapper.markDirtyFromReady("BOOK", preview.bookId(), now);
-        }
-        long eventQuotaGeneration = userProjection.generation()
-                + (!redisMode && "READY".equals(userProjection.state()) ? 1 : 0);
-        long eventStockGeneration = bookProjection.generation()
-                + (!redisMode && "READY".equals(bookProjection.state()) ? 1 : 0);
-        if (mapper.returnLoan(loanId, userId, reason, now) != 1
+
+        if (mapper.returnLoan(loanId, userId, reason,
+                LoanStatus.BORROWED, LoanStatus.RETURNED, now) != 1
                 || mapper.releaseQuota(userId, now) != 1
-                || mapper.releaseStock(preview.bookId(), now) != 1) {
-            // 任一更新影響零行都代表計數不變量遭破壞；拋出例外會回滾整筆交易。
+                || mapper.releaseStock(preview.getBookId(), now) != 1) {
+            // 任一更新失败都表示持久化计数不一致，抛出例外以回滚整笔归还。
             throw new IllegalStateException("Lending invariant violation while returning loan");
         }
+
         LoanRow returned = mapper.findLoan(loanId, userId);
         var payload = loanPayload(returned);
-        payload.put("quotaGeneration", eventQuotaGeneration);
-        payload.put("stockGeneration", eventStockGeneration);
         payload.put("accountVersion", mapper.accountVersion(userId));
-        payload.put("stockVersion", mapper.stockVersion(preview.bookId()));
-        outbox.append("Loan", returned.loanId(), "BookReturned", returned.version(), payload, false);
-        return new ReturnResult(returned, userProjection.generation(), bookProjection.generation(), true);
+        payload.put("stockVersion", mapper.stockVersion(preview.getBookId()));
+        outbox.append(AggregateType.LOAN, returned.getLoanId(), DomainEventType.BOOK_RETURNED,
+                returned.getVersion(), payload);
+        return returned;
     }
 
-    private ProjectionControlRow lockProjection(String type, long id, boolean update) {
-        return update ? mapper.lockProjectionUpdate(type, id) : mapper.lockProjectionShare(type, id);
-    }
-
-    private static void requireProjection(ProjectionControlRow projection, Long expected, boolean dbOnly) {
-        if (projection == null || "REBUILDING".equals(projection.state())) {
-            throw unavailable();
+    /** 验证既有幂等请求的参数并回传其稳定 Loan。 */
+    private BorrowResult replay(LoanRow loan, long bookId) {
+        if (loan.getBookId() != bookId) {
+            throw DomainException.of(ErrorCode.IDEMPOTENCY_KEY_REUSED, false, loan.getRequestId());
         }
-        if (!dbOnly && (!"READY".equals(projection.state()) || expected == null
-                || projection.generation() != expected)) {
-            throw unavailable();
-        }
+        return new BorrowResult(loan, true);
     }
 
-    private static void requireReturnProjection(ProjectionControlRow projection, boolean redisMode) {
-        if (projection == null || "REBUILDING".equals(projection.state())
-                || (redisMode && !"READY".equals(projection.state()))) {
-            throw unavailable();
-        }
-    }
-
-    private static DomainException unavailable() {
-        return new DomainException(ErrorCode.SERVICE_UNAVAILABLE, HttpStatus.SERVICE_UNAVAILABLE,
-                "Lending resource is being rebuilt", true);
-    }
-
+    /** 建立事件使用的借阅快照，避免消费者为基本资料再次查询交易表。 */
     private static LinkedHashMap<String, Object> loanPayload(LoanRow loan) {
         var payload = new LinkedHashMap<String, Object>();
-        payload.put("requestId", Long.toUnsignedString(loan.requestId()));
-        payload.put("loanId", Long.toUnsignedString(loan.loanId()));
-        payload.put("userId", Long.toUnsignedString(loan.userId()));
-        payload.put("bookId", Long.toUnsignedString(loan.bookId()));
-        payload.put("status", loan.status());
-        payload.put("borrowedAt", loan.borrowedAt());
-        payload.put("dueAt", loan.dueAt());
-        payload.put("returnedAt", loan.returnedAt());
-        payload.put("returnReason", loan.returnReason());
+        payload.put("requestId", Long.toUnsignedString(loan.getRequestId()));
+        payload.put("loanId", Long.toUnsignedString(loan.getLoanId()));
+        payload.put("userId", Long.toUnsignedString(loan.getUserId()));
+        payload.put("bookId", Long.toUnsignedString(loan.getBookId()));
+        payload.put("status", loan.getStatus());
+        payload.put("borrowedAt", loan.getBorrowedAt());
+        payload.put("dueAt", loan.getDueAt());
+        payload.put("returnedAt", loan.getReturnedAt());
+        payload.put("returnReason", loan.getReturnReason());
         return payload;
     }
 
-    private LocalDateTime nowDb() { return LocalDateTime.ofInstant(clock.now(), ZoneOffset.UTC); }
+    private LocalDateTime nowDb() {
+        return LocalDateTime.ofInstant(clock.now(), ZoneOffset.UTC);
+    }
 
-    public record ReturnResult(LoanRow loan, long quotaGeneration, long stockGeneration, boolean changed) { }
+    /** 借阅交易结果，标示本次呼叫建立新 Loan 或重放既有结果。 */
+    @Getter
+    @RequiredArgsConstructor
+    public static final class BorrowResult {
+        private final LoanRow loan;
+        private final boolean replay;
+    }
 }

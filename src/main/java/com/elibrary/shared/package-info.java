@@ -1,4 +1,4 @@
 /**
- * 跨上下文共用的技術能力，包含設定、識別碼、錯誤模型、Web 上下文與 Outbox。
+ * 跨上下文共用的技术能力，包括配置、标识码、HTTP 公共能力与交易式 Outbox。
  */
 package com.elibrary.shared;

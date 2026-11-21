@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8" ?>
 <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
 <mapper namespace="com.elibrary.catalog.infrastructure.CatalogMapper">
-  <!-- 共用欄位清單保持 Record 建構參數順序，並避免星號查詢帶來結構耦合。 -->
+  <!-- 共用栏位清单配合 JavaBean 属性映射，并避免星号查询带来结构耦合。 -->
   <sql id="bookColumns">
     b.book_id, b.isbn, b.title, b.subtitle, b.authors, b.publisher, b.category_id,
     b.language, b.description, b.cover_url, b.published_date, b.format, b.status,
@@ -17,7 +17,7 @@
     CAST(NULL AS SIGNED) AS stock_version
   </sql>
 
-  <!-- 公開讀取與交易內書目快照。 -->
+  <!-- 公开读取与交易内书目快照。 -->
   <select id="findById" resultType="com.elibrary.catalog.infrastructure.BookRow">
     SELECT <include refid="bookColumns"/>
     FROM book b
@@ -36,7 +36,7 @@
     SELECT <include refid="bookColumns"/>
     FROM book b
     LEFT JOIN lending_stock s ON s.book_id = b.book_id
-    WHERE b.status = 'PUBLISHED'
+    WHERE b.status = #{status}
       AND b.book_id &gt; #{afterId}
     <if test="query != null and query != ''">
       AND b.title LIKE CONCAT(#{query}, '%')
@@ -47,45 +47,42 @@
     <if test="language != null and language != ''">
       AND b.language = #{language}
     </if>
-    <if test="format != null and format != ''">
+    <if test="format != null">
       AND b.format = #{format}
     </if>
     ORDER BY b.book_id
     LIMIT #{limit}
   </select>
 
-  <select id="lockWriteGate" resultType="string">
-    SELECT state FROM catalog_write_gate WHERE id = 1 FOR SHARE
-  </select>
-
-  <!-- 書目寫入必須與 Outbox 事件位於同一個應用層交易。 -->
+  <!-- 书目写入必须与 Outbox 事件位于同一个应用层交易。 -->
   <insert id="insertBook">
     INSERT INTO book(
       book_id, isbn, title, subtitle, authors, publisher, category_id, language,
       description, cover_url, published_date, format, status, version, created_at, updated_at
     ) VALUES (
-      #{bookId}, #{isbn}, #{title}, #{subtitle}, CAST(#{authorsJson} AS JSON), #{publisher},
-      #{categoryId}, #{language}, #{description}, #{coverUrl}, #{publishedDate}, #{format},
-      'DRAFT', 1, #{now}, #{now}
+      #{bookId}, #{metadata.isbn}, #{metadata.title}, #{metadata.subtitle},
+      JSON_ARRAY(
+        <foreach collection="metadata.authors" item="author" separator=",">
+          #{author}
+        </foreach>
+      ),
+      #{metadata.publisher}, #{metadata.categoryId}, #{metadata.language}, #{metadata.description},
+      #{metadata.coverUrl}, #{metadata.publishedDate}, #{metadata.format}, #{status}, 1, #{now}, #{now}
     )
-  </insert>
-
-  <insert id="insertStock">
-    INSERT INTO lending_stock(book_id, total_copies, available_copies, version, updated_at)
-    VALUES (#{bookId}, 0, 0, 0, #{now})
-  </insert>
-
-  <insert id="insertBookProjection">
-    INSERT INTO projection_control(resource_type, resource_id, generation, state, updated_at)
-    VALUES ('BOOK', #{bookId}, 1, 'DIRTY', #{now})
   </insert>
 
   <update id="updateBook">
     UPDATE book
-    SET isbn = #{isbn}, title = #{title}, subtitle = #{subtitle},
-        authors = CAST(#{authorsJson} AS JSON), publisher = #{publisher},
-        category_id = #{categoryId}, language = #{language}, description = #{description},
-        cover_url = #{coverUrl}, published_date = #{publishedDate}, format = #{format},
+    SET isbn = #{metadata.isbn}, title = #{metadata.title}, subtitle = #{metadata.subtitle},
+        authors = JSON_ARRAY(
+          <foreach collection="metadata.authors" item="author" separator=",">
+            #{author}
+          </foreach>
+        ),
+        publisher = #{metadata.publisher}, category_id = #{metadata.categoryId},
+        language = #{metadata.language}, description = #{metadata.description},
+        cover_url = #{metadata.coverUrl}, published_date = #{metadata.publishedDate},
+        format = #{metadata.format},
         version = version + 1, updated_at = #{now}
     WHERE book_id = #{bookId} AND version = #{version}
   </update>
@@ -93,36 +90,11 @@
   <update id="changeStatus">
     UPDATE book
     SET status = #{status}, version = version + 1, updated_at = #{now}
-    WHERE book_id = #{bookId} AND status != #{status}
-  </update>
-
-  <update id="resizeStock">
-    UPDATE lending_stock
-    SET available_copies = available_copies + (#{newTotal} - total_copies),
-        total_copies = #{newTotal}, version = version + 1, updated_at = #{now}
     WHERE book_id = #{bookId}
-      AND #{newTotal} BETWEEN 0 AND 100000
-      AND available_copies + (#{newTotal} - total_copies) &gt;= 0
+      AND status IN
+      <foreach collection="allowedSources" item="source" open="(" separator="," close=")">
+        #{source}
+      </foreach>
   </update>
 
-  <!-- 庫存調整後推進投影代次，讓舊 Redis 命名空間停止接收新寫入。 -->
-  <select id="lockBookProjection" resultType="long">
-    SELECT generation
-    FROM projection_control
-    WHERE resource_type = 'BOOK' AND resource_id = #{bookId}
-    FOR UPDATE
-  </select>
-
-  <update id="beginBookProjectionRebuild">
-    UPDATE projection_control
-    SET generation = generation + 1, state = 'DIRTY', owner_token = NULL,
-        lease_until = NULL, updated_at = #{now}
-    WHERE resource_type = 'BOOK' AND resource_id = #{bookId}
-  </update>
-
-  <select id="bookProjectionGeneration" resultType="long">
-    SELECT generation
-    FROM projection_control
-    WHERE resource_type = 'BOOK' AND resource_id = #{bookId}
-  </select>
 </mapper>

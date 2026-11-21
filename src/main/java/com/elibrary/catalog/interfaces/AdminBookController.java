@@ -1,64 +1,106 @@
 package com.elibrary.catalog.interfaces;
 
 import com.elibrary.catalog.application.CatalogService;
-import com.elibrary.shared.web.UserContext;
+import com.elibrary.catalog.domain.BookFormat;
+import com.elibrary.catalog.domain.BookMetadata;
+import com.elibrary.catalog.domain.BookStatus;
+import com.elibrary.shared.web.api.Resp;
+import com.elibrary.shared.web.security.UserContext;
 import jakarta.validation.Valid;
-import org.springframework.http.HttpStatus;
+import jakarta.validation.constraints.Positive;
+import lombok.RequiredArgsConstructor;
+import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
- * 提供管理員書目與借閱席位維護 API。所有端點都會在進入應用服務前驗證 ADMIN 角色。
+ * 提供管理员书目与借阅席位维护 API。所有端点都会在进入应用服务前验证 ADMIN 角色。
  */
 @RestController
+@Validated
 @RequestMapping("/api/v1/admin/books")
+@RequiredArgsConstructor
 public class AdminBookController {
     private final CatalogService service;
 
-    public AdminBookController(CatalogService service) {
-        this.service = service;
-    }
-
-    /** 建立 DRAFT 書目，並在同一交易內初始化零庫存與書籍投影控制資料。 */
+    /**
+     * 建立 DRAFT 书目，并在同一事务内初始化零容量借阅库存。
+     *
+     * @param request 经过字段验证的书目创建数据
+     * @return 新建书目的统一响应
+     */
     @PostMapping
-    @ResponseStatus(HttpStatus.CREATED)
-    public BookDtos.BookResponse create(@Valid @RequestBody BookDtos.BookUpsertRequest request) {
+    public Resp<BookDtos.BookResponse> create(@Valid @RequestBody BookDtos.BookCreateRequest request) {
         UserContext.requireAdmin();
-        return service.create(request);
+        return Resp.success(service.create(toMetadata(request)));
     }
 
-    /** 以請求中的 version 執行樂觀鎖更新，避免管理員覆蓋其他人的修改。 */
+    /**
+     * 以请求中的 version 执行乐观锁更新，避免管理员覆盖其他人的修改。
+     *
+     * @param bookId  待更新书籍标识码，必须为正整数
+     * @param request 经过字段验证的完整书目数据及预期版本
+     * @return 更新后书目的统一响应
+     */
     @PutMapping("/{bookId}")
-    public BookDtos.BookResponse update(@PathVariable String bookId,
-                                        @Valid @RequestBody BookDtos.BookUpsertRequest request) {
+    public Resp<BookDtos.BookResponse> update(@PathVariable @Positive long bookId,
+                                              @Valid @RequestBody BookDtos.BookUpdateRequest request) {
         UserContext.requireAdmin();
-        return service.update(Long.parseUnsignedLong(bookId), request);
+        return Resp.success(service.update(bookId, request.getVersion(), toMetadata(request)));
     }
 
-    /** 將書籍切換為可被一般使用者瀏覽與借閱的 PUBLISHED 狀態。 */
+    /**
+     * 将书籍切换为可供普通用户浏览与借阅的 PUBLISHED 状态。
+     *
+     * @param bookId 待上架书籍标识码，必须为正整数
+     * @return 上架后书目的统一响应
+     */
     @PostMapping("/{bookId}/publish")
-    public BookDtos.BookResponse publish(@PathVariable String bookId) {
+    public Resp<BookDtos.BookResponse> publish(@PathVariable @Positive long bookId) {
         UserContext.requireAdmin();
-        return service.changeStatus(Long.parseUnsignedLong(bookId), "PUBLISHED");
+        return Resp.success(service.changeStatus(bookId, BookStatus.PUBLISHED));
     }
 
-    /** 將書籍下架；既有 Loan 仍可正常查詢與歸還。 */
+    /**
+     * 将书籍下架；已有 Loan 仍可正常查询与归还。
+     *
+     * @param bookId 待下架书籍标识码，必须为正整数
+     * @return 下架后书目的统一响应
+     */
     @PostMapping("/{bookId}/offline")
-    public BookDtos.BookResponse offline(@PathVariable String bookId) {
+    public Resp<BookDtos.BookResponse> offline(@PathVariable @Positive long bookId) {
         UserContext.requireAdmin();
-        return service.changeStatus(Long.parseUnsignedLong(bookId), "OFFLINE");
+        return Resp.success(service.changeStatus(bookId, BookStatus.OFFLINE));
     }
 
-    /** 調整總借閱席位；新總量不得低於目前已借出的數量。 */
+    /**
+     * 调整总借阅席位；新总量不得低于当前已借出的数量。
+     *
+     * @param bookId 待调整书籍标识码，必须为正整数
+     * @param request 经过字段验证的新席位总量
+     * @return 调整后书目与可借数量的统一响应
+     */
     @PutMapping("/{bookId}/stock")
-    public BookDtos.BookResponse resizeStock(@PathVariable String bookId,
-                                             @Valid @RequestBody BookDtos.StockRequest request) {
+    public Resp<BookDtos.BookResponse> resizeStock(@PathVariable @Positive long bookId,
+                                                   @Valid @RequestBody BookDtos.StockRequest request) {
         UserContext.requireAdmin();
-        return service.resizeStock(Long.parseUnsignedLong(bookId), request.totalCopies());
+        return Resp.success(service.resizeStock(bookId, request.getTotalCopies()));
+    }
+
+    /**
+     * 将 HTTP 请求转换为不依赖传输格式的领域值对象。
+     *
+     * @param request 书目创建或更新请求
+     * @return 经过领域构造规则整理的书目数据
+     */
+    private static BookMetadata toMetadata(BookDtos.BookMetadataRequest request) {
+        return new BookMetadata(request.getIsbn(), request.getTitle(), request.getSubtitle(),
+                request.getAuthors(), request.getPublisher(), request.getCategoryId(),
+                request.getLanguage(), request.getDescription(), request.getCoverUrl(),
+                request.getPublishedDate(), BookFormat.from(request.getFormat()));
     }
 }

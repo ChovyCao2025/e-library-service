@@ -1,3 +1,4 @@
+# 正式环境强制停用开发身分与互动式 API 文件。
 app:
   auth:
     dev-mode: false

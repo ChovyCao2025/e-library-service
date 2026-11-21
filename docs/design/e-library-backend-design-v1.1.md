@@ -68,8 +68,10 @@ Redis 预占值与数据库值允许暂时偏离。数据库条件更新和唯�
 | Spring Boot | `4.0.9` GA | 官方 4.0 系统要求包含 Java 21；选用已发布的 4.0 维护线 |
 | MyBatis Starter | `4.0.1` | 官方兼容表中 4.0 系列对应 Boot 4.0+；Maven Central 存在该制品 |
 | MapStruct | `1.6.3` | 使用正式版，运行依赖与注解处理器使用相同版本 |
+| Lombok | `1.18.48` | 仅生成构造器及访问器，不使用 `@Data` 隐式引入对象相等与字符串输出语义 |
 | springdoc | `3.0.3` | 官方矩阵中 Boot 4.0.x 对应 springdoc 3.0.x；Central 存在该制品 |
 | RocketMQ Java SDK | `5.2.1` | 使用官方 `rocketmq-client-java`，通过项目端口接入，避免绑定未经验证的 Boot Starter |
+| XXL-JOB Core | `3.5.0` | 执行器接入调度中心，仅用于 Outbox 遗漏及失败事件补偿 |
 | HikariCP、Lettuce、Caffeine、Micrometer、Jackson | Boot BOM 管理 | 导出实际 dependency tree；对显式覆盖的依赖记录原因和测试 |
 | 数据迁移与测试 | Flyway、Testcontainers、ArchUnit、k6 | 由 M0 锁定与 Boot 基线匹配的正式版本，并完成冒烟验证 |
 
@@ -105,7 +107,7 @@ flowchart TB
     A --> RC[(独立 Redis: 书目缓存)]
     A --> ES[(Elasticsearch: 书目检索)]
     A --> DB[(MySQL: 请求、库存、配额、借阅、Outbox)]
-    DB --> O[Outbox Relay]
+    DB --> O[Outbox 提交后直发 / XXL-JOB 补偿]
     O --> MQ[RocketMQ: 业务事件]
     MQ --> SI[搜索消费者]
     MQ --> CI[缓存失效消费者]
@@ -125,7 +127,7 @@ flowchart TB
 | --- | --- |
 | catalog | 书目、分类、上下架、书目版本、书目事件 |
 | lending | 库存、配额、借阅、幂等请求、资源预占及恢复 |
-| search | 搜索、游标、索引同步、重建任务 |
+| search | 搜索、索引同步与重建任务 |
 | admin.application | 调用业务门面编排管理员用例，声明同库事务 |
 | shared | ID、时间、错误、追踪、可信用户上下文、Outbox 通用机制 |
 
@@ -157,21 +159,9 @@ flowchart TB
 
 ### 4.2 持久借阅请求
 
-```mermaid
-stateDiagram-v2
-    [*] --> PROCESSING: 创建请求或启动新 attempt
-    PROCESSING --> SUCCEEDED: 借阅事务提交
-    PROCESSING --> RELEASING: 确定失败或租约到期并被裁决
-    RELEASING --> RETRYABLE: 两段预占已清理或相应代次已作废
-    RETRYABLE --> PROCESSING: 相同参数显式重试，attempt 增加
-    SUCCEEDED --> SUCCEEDED: 返回原 loanId 对应的借阅
-```
+请求以 `(userId, idemKey)` 唯一定位，保存固定的 `bookId` 与 `requestId`；Loan 通过唯一的 `requestId` 关联。请求记录、Loan、库存、配额和 Outbox 位于同一 MySQL 事务；成功时共同提交，失败时整体回滚，不持久化中间状态。
 
-请求以 `(userId, idemKey)` 唯一定位，`bookId` 和请求指纹创建后保持固定；`loanId` 在首次创建请求时生成，跨 attempt 保持稳定。
-
-`attemptToken` 包含 `requestId + attempt`。同一时刻只有一个有效 attempt。其他相同请求返回原结果或 `REQUEST_IN_PROGRESS`。同一键对应不同 `bookId` 或不同指纹时返回 422。
-
-成功记录及其参数指纹在本版持续保留。借阅归档和幂等记录清理属于后续数据生命周期设计，实施时须保留既有重放语义。
+相同键与相同 `bookId` 返回原 Loan；同一键改借其他书籍时返回 `IDEMPOTENCY_KEY_REUSED`。借阅归档和幂等记录清理属于后续数据生命周期设计，实施时须保留既有重放语义。
 
 ### 4.3 资源投影控制
 
@@ -255,27 +245,8 @@ CREATE TABLE borrow_request (
   user_id BIGINT UNSIGNED NOT NULL,
   idem_key VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
   book_id BIGINT UNSIGNED NOT NULL,
-  request_hash CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
-  loan_id BIGINT UNSIGNED NOT NULL,
-  status VARCHAR(12) NOT NULL,
-  attempt INT NOT NULL DEFAULT 1,
-  attempt_token VARCHAR(80) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
-  admission_mode VARCHAR(8) NOT NULL DEFAULT 'REDIS',
-  quota_generation BIGINT NULL,
-  stock_generation BIGINT NULL,
-  lease_until DATETIME(3) NOT NULL,
-  quota_settled TINYINT NOT NULL DEFAULT 0,
-  stock_settled TINYINT NOT NULL DEFAULT 0,
-  result_code VARCHAR(64) NULL,
   created_at DATETIME(3) NOT NULL,
-  updated_at DATETIME(3) NOT NULL,
-  UNIQUE KEY uk_request_user_idem (user_id, idem_key),
-  UNIQUE KEY uk_request_loan (loan_id),
-  KEY idx_request_recovery (status, lease_until, request_id),
-  CONSTRAINT ck_admission_mode CHECK (admission_mode IN ('REDIS','DB_ONLY')),
-  CONSTRAINT ck_request_status CHECK (
-    status IN ('PROCESSING','SUCCEEDED','RELEASING','RETRYABLE')
-  )
+  UNIQUE KEY uk_request_user_idem (user_id, idem_key)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE loan (
@@ -283,7 +254,6 @@ CREATE TABLE loan (
   request_id BIGINT UNSIGNED NOT NULL,
   user_id BIGINT UNSIGNED NOT NULL,
   book_id BIGINT UNSIGNED NOT NULL,
-  idem_key VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
   status VARCHAR(10) NOT NULL,
   active_key TINYINT GENERATED ALWAYS AS (
     CASE WHEN status = 'BORROWED' THEN 1 ELSE NULL END
@@ -297,9 +267,8 @@ CREATE TABLE loan (
   created_at DATETIME(3) NOT NULL,
   updated_at DATETIME(3) NOT NULL,
   UNIQUE KEY uk_loan_request (request_id),
-  UNIQUE KEY uk_user_idem (user_id, idem_key),
   UNIQUE KEY uk_user_book_active (user_id, book_id, active_key),
-  KEY idx_user_status_time (user_id, status, borrowed_at, loan_id),
+  KEY idx_user_status_id (user_id, status, loan_id),
   KEY idx_book_active (book_id, active_key, loan_id),
   KEY idx_status_due (status, due_at, loan_id),
   CONSTRAINT ck_loan_status CHECK (status IN ('BORROWED','RETURNED')),
@@ -450,7 +419,7 @@ application 层声明事务；事务体只执行当前 MySQL 数据源的操作�
 | 用户 | `{u:456}:g2:count` | 提交占用与临时预占合计 |
 | 用户 | `{u:456}:g2:occupied` | HASH：loanId -> token、PENDING/COMMITTED |
 | 用户 | `{u:456}:g2:pending` | ZSET：token、loanId、到期时间 |
-| 用户 | `{u:456}:g2:idem:<hash>` | requestId、loanId、attempt、参数指纹的加速映射 |
+| 用户 | `{u:456}:g2:idem:<hash>` | requestId、loanId、bookId、attempt 的加速映射 |
 | 两种资源 | 对应 tag 下的 `cancel:<token>` | 取消标记，拦截迟到的同 token 预占 |
 
 RedisKeys 统一构造键名；用户与书籍 ID 使用十进制字符串。幂等键在缓存键中使用摘要，原始键仍由数据库持久校验。
@@ -562,15 +531,17 @@ Redis 恢复后，受影响资源先进入受限恢复模式。重建失败保�
 
 Topic 按 `catalog-book / lending-loan / lending-stock` 划分。搜索、缓存、预占恢复分别使用独立消费组。事件按类型订阅，正常投递按至少一次处理；消费者使用业务身份与版本处理重复、乱序。
 
-### 9.2 Relay 认领与发送
+### 9.2 提交后直发与 XXL-JOB 补偿
 
 ```text
-短事务 A：锁定可发送行 -> 标记 CLAIMED、owner、租约 -> 提交
+业务事务：修改聚合 -> 写入 NEW Outbox -> 共同提交
+提交后：有界线程池按 eventId 条件认领 -> 标记 CLAIMED、owner、租约
 事务外：调用 RocketMQ SDK，收集发送回执
-短事务 B：按 owner 条件更新 SENT，或设置下次重试时间
+短事务：按 owner 条件更新 SENT，或设置下次重试时间
+补偿路径：XXL-JOB 扫描到期 NEW 与过期 CLAIMED -> 执行相同投递流程
 ```
 
-认领查询使用 `FOR UPDATE SKIP LOCKED`，批次初值 200，扫描间隔初值 200ms。过期 CLAIMED 可重新认领；每次认领生成新 owner token。发送成功但记录回执前崩溃，会产生重复消息，由消费端协议吸收。
+直发路径使用原子条件更新认领刚提交的 eventId；线程池队列有界，拒绝执行时事件保留为 NEW。补偿路径由 XXL-JOB 调度，批次查询使用 `FOR UPDATE SKIP LOCKED`，批次初值 200；过期 CLAIMED 可重新认领，每次认领生成新 owner token。两条路径并发时仅条件更新成功的一方持有事件。发送成功但记录回执前崩溃，会产生重复消息，由消费端协议吸收。
 
 发送超时记录为结果未知并重试，SENT 表示 SDK/Broker 发送确认；其磁盘、复制保障另受第 11 节生产配置约束。
 
@@ -671,22 +642,18 @@ CREATE TABLE search_reindex_job (
 
 - 详情：L1 5 秒 -> 独立 Redis 书目缓存 10 分钟并抖动 -> MySQL。静态资料与动态余量分别获取后组合。
 - 搜索：ES 返回 ID、摘要和排序；按槽批量查询库存展示值；冷资源、DIRTY 资源及失败项在预算内批量回源 MySQL。
-- 我的借阅：按当前用户主库游标查询，批量获取书目摘要；已下架书摘要仍可用于自己的历史和当前借阅显示。
+- 我的借阅：按当前用户和 `afterLoanId` 查询，批量获取书目摘要；已下架书摘要仍可用于自己的历史和当前借阅显示。
 - `availability` 是带时效的估算，包含 `available / total / asOf / source`，补充失败时为 null。借阅结果以提交事务为准。
 - 详情整包包含动态余量，采用 `Cache-Control: no-store`，静态资料在服务端内部缓存。去掉仅由 book.version 决定的整包 ETag，避免库存变化被错误判断为整包未变。
 - 缓存中的上架可见性允许事件和 TTL 带来的短期延迟；新增借阅的上架判断在数据库中强制执行。展示文案和接口文档明确区分这两种时效。
 
 缓存采用空值短缓存、TTL 抖动、同进程单飞和有界回源。跨实例需要互斥回源时使用带 owner 的短租约，网络失败退回限流路径。L1 失效通过事件和缓存广播加速，TTL 覆盖通知遗漏。
 
-### 10.2 游标契约与搜索降级
+### 10.2 寻址分页
 
-游标包含格式版本、查询指纹、排序、后端、过期时间和后端状态，编码并签名。查询指纹覆盖关键词、筛选、排序、用户范围和分页大小；参数变化要求重新开始。
+书目列表按 `book_id` 升序查询，下一页传入上一页返回的 `nextBookId` 作为 `afterBookId`。借阅列表按 `loan_id` 降序查询，下一页传入 `nextLoanId` 作为 `afterLoanId`。
 
-ES 使用 `search_after + PIT`，PIT 续期初值 60 秒，超时后返回 `CURSOR_EXPIRED`。数据库游标采用稳定排序键，借阅列表为 `(borrowed_at, loan_id)`。
-
-ES 故障时，无游标的首次列表请求可在数据库预算内降级为标题前缀查询和 bookId 排序，响应 `X-Search-Degraded: true` 并签发 DB 游标。已有 ES 游标的请求返回 503，提示去掉游标重开；DB 游标在其生命周期内继续采用 DB 后端。
-
-数据库降级仅支持明确列出的筛选和前缀匹配。增加覆盖查询路径的索引，使用执行计划及代表性数据验证；耗时超过预算返回 503。精确总数不作为本版分页承诺，响应提供 items、nextCursor、hasMore。
+查询多读取一笔判断 `hasMore`，不执行总数统计。分页位置使用普通 ID，不进行编码、签名或过期管理。
 
 ### 10.3 接口清单
 
@@ -697,7 +664,6 @@ ES 故障时，无游标的首次列表请求可在数据库预算内降级为�
 | GET /books | 搜索或浏览，默认 size=20，最大 50 |
 | GET /books/{bookId} | 书目详情及余量估算 |
 | POST /loans | body 为 bookId；首次成功 201；成功重放 200 |
-| GET /borrow-requests/{requestId} | 仅本人可查，返回状态、可重试信息及成功 loanId |
 | GET /loans/{loanId} | 仅本人可查 |
 | POST /loans/{loanId}/return | 主动归还，重复归还同样 200 |
 | GET /users/me/loans | 默认当前未到期借阅，可指定 RETURNED 查询历史 |
@@ -748,9 +714,8 @@ Content-Type: application/json
 | --- | --- | --- |
 | VALIDATION_FAILED | 400 | 参数及格式错误 |
 | MISSING_IDEMPOTENCY_KEY | 400 | 缺少幂等键 |
-| CURSOR_INVALID / CURSOR_EXPIRED | 400 | 重新开始查询 |
 | UNAUTHENTICATED / FORBIDDEN | 401 / 403 | 身份无效或角色不足 |
-| BOOK_NOT_FOUND / LOAN_NOT_FOUND / REQUEST_NOT_FOUND | 404 | 资源不可见或不属于当前用户 |
+| BOOK_NOT_FOUND / LOAN_NOT_FOUND | 404 | 资源不可见或不属于当前用户 |
 | BOOK_SOLD_OUT | 409 | 当前无法分配席位，可稍后以相同键重试 |
 | BOOK_NOT_BORROWABLE | 409 | 当前书目状态禁止新增借阅 |
 | ALREADY_BORROWED / LOAN_LIMIT_EXCEEDED | 409 | 已借该书或达到当前额度 |
@@ -758,7 +723,7 @@ Content-Type: application/json
 | DUPLICATE_ISBN / STOCK_BELOW_BORROWED / VERSION_CONFLICT | 409 | 管理员业务冲突 |
 | IDEMPOTENCY_KEY_REUSED | 422 | 同一键对应不同请求参数 |
 | RATE_LIMITED | 429 | 附 Retry-After |
-| SERVICE_UNAVAILABLE | 503 | 依赖、维护或容量预算不足；需要时提示重开游标 |
+| SERVICE_UNAVAILABLE | 503 | 依赖、维护或容量预算不足 |
 | INTERNAL_ERROR | 500 | 未预期错误，附 traceId |
 
 业务拒绝与故障分别统计。资源是否可再次尝试由当前业务状态决定；成功请求无论后续库存如何变化均先走幂等重放。
@@ -811,10 +776,10 @@ HPA 扩容、DB-only 并发和故障回源按同一预算计算。缓存及搜�
 
 | 故障 | 在线行为 | 恢复与验证 |
 | --- | --- | --- |
-| API 被杀、响应丢失 | 同一幂等键重试或查 requestId | 主库请求和 Loan 裁决；过期 attempt 补偿 |
+| API 被杀、响应丢失 | 使用同一幂等键重试 | 主库请求和 Loan 裁决 |
 | Redis 超时或不可达 | attempt 固定模式；有界 DB_ONLY | 受影响投影标 DIRTY，受控重建后恢复正常预占 |
 | Redis 部分丢写、错值 | DB 拒绝违规修改，可能误拒或增加无效尝试 | 拓扑/拒绝率/对账联合检测，资源代次重建 |
-| ES 不可用 | 首次查询有界降级，原 ES 游标返回重开提示 | 消费追赶；必要时启动重建任务 |
+| ES 不可用 | 搜索能力暂时不可用 | 消费追赶；必要时启动重建任务 |
 | MQ 不可用 | 数据库提交仍可成功，事件留在 Outbox | 容量和滞后告警；恢复后补发与回放 |
 | MySQL 不可写或主切换 | 写入返回可重试错误；未知结果保留预占 | 主库恢复后裁决，演练重复请求与确认结果 |
 | Redis 重建 Worker 被杀 | 目标资源暂时 REBUILDING | 租约到期后接管，owner CAS 保护收尾 |
@@ -844,7 +809,7 @@ flowchart LR
     Q --> W[有界借阅 Worker]
     W --> T[相同 MySQL 借阅事务]
     T --> S[持久请求状态]
-    C[客户端按 requestId 查询] --> S
+    C[客户端使用同一幂等键重试] --> S
 ```
 
 该模式需要独立 ADR 与接口版本约定，包含命令接收的持久化边界、请求状态初始化、队列容量、过期、取消、重复投递和补偿。受理成功返回 202，最终成功仍以数据库借阅事务提交为准。
@@ -894,7 +859,7 @@ Redis 的书籍库存键若需要分桶，应同时设计同一用户同书的�
 | L1 / L2 metadata TTL | 5s / 600s，L2 抖动 ±20% |
 | null metadata TTL | 60s |
 | expire scan interval / batch | 30s / 500 |
-| outbox interval / batch / lease | 200ms / 200 / 30s |
+| outbox direct threads / queue / batch / lease | 2 / 500 / 200 / 30s；补偿周期由 XXL-JOB 配置 |
 | ES timeout / PIT keepalive | 800ms / 60s |
 | page default / max | 20 / 50 |
 | candidate SLO | 可用性 99.95%，成功借阅 P99 150ms，搜索 P99 200ms |
@@ -935,7 +900,7 @@ Redis 的书籍库存键若需要分桶，应同时设计同一用户同书的�
 | F10 | MQ 发送成功但未记录 SENT | 重复投递无重复副作用 |
 | F11 | ES Bulk 部分失败、消息重复乱序 | 每项回执正确，最大书目版本生效 |
 | F12 | 重建全量与增量并发，切换时崩溃 | 新索引包含应有变更，任务可按真实别名恢复 |
-| F13 | ES 分页途中故障 | 游标后端契约成立，客户端收到明确重开提示 |
+| F13 | ES 分页途中故障 | 查询返回明确错误，客户端可从第一页重新请求 |
 | F14 | 热点借阅压满准入 | 归还有独立预算，降级不突破数据库总连接预算 |
 | F15 | MySQL 主切换及历史备份恢复 | 核对已确认结果、未知结果、RPO/RTO及状态守恒 |
 
@@ -961,7 +926,7 @@ application 通过 port 调用外部适配器；数据库事务方法放在独�
 | M0 版本与脚手架 | versions.lock、Maven Wrapper、依赖树、健康检查、Flyway、Compose、ES+IK、MQ+Proxy | Java 21 下实际启动与各组件冒烟，版本依据完整 |
 | M1 纯数据库核心 | 书目、库存、账户、请求台账、Loan；借还、上下架及调库存事务 | T01–T12 在数据库路径通过 |
 | M2 双预占 | 同槽脚本、令牌、两段执行、裁决、补偿与资源控制 | F01–F09，脚本边界和跨槽测试 |
-| M3 事件与读模型 | Relay、消费者回执、书目缓存、搜索、游标、降级 | F10–F13及查询集成测试 |
+| M3 事件与读模型 | 提交后直发、XXL-JOB 补偿、消费者回执、书目缓存、搜索与降级 | F10–F13及查询集成测试 |
 | M4 运维与高可用 | 归还隔离、容量预算、DIRTY恢复、到期任务、备份恢复和可观测性 | F14–F15，故障演练报告 |
 | M5 交付 | OpenAPI、seed、curl、k6、README、镜像与部署参考 | 从干净环境启动并走完核心流程，报告实际结果 |
 
@@ -985,7 +950,7 @@ seed 保留 100 本普通书和一本热点演示书；库存量标为测试数�
 | Redis恢复 | 采用资源代次、DIRTY/REBUILDING、受控快照与主库裁决；限定 canary 检测范围 |
 | Outbox | 认领、网络发送、回执分离，发送状态与消费状态分别追踪 |
 | ES | 版本保护的下架文档、持续增量捕获、持久写闸门和可恢复切换任务 |
-| 读路径 | 静态缓存与动态余量分离，修正 ETag，补充游标后端及降级契约 |
+| 读路径 | 静态缓存与动态余量分离，修正 ETag，使用简单 ID 寻址分页 |
 | 热点和高可用 | 补全归还隔离、数据库总预算、排队与分桶演进、故障模型及恢复验收 |
 | 规模与性能 | 假设、目标、初值和实测分开记录，分片及拆服务采用独立事务设计 |
 

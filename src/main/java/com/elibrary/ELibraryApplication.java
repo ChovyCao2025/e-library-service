@@ -1,18 +1,16 @@
 package com.elibrary;
 
-import org.mybatis.spring.annotation.MapperScan;
-import org.apache.ibatis.annotations.Mapper;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.context.properties.ConfigurationPropertiesScan;
 import org.springframework.scheduling.annotation.EnableScheduling;
 
-/** E-Library 應用程式進入點，同時啟用排程工作、Mapper 掃描與型別化設定。 */
+/** E-Library 应用程式进入点，同时启用排程工作与型别化设定。 */
 @EnableScheduling
-@MapperScan(basePackages = "com.elibrary", annotationClass = Mapper.class)
 @ConfigurationPropertiesScan
 @SpringBootApplication
 public class ELibraryApplication {
+    /** 启动 Spring Boot 容器与所有排程、Web、持久化元件。 */
     public static void main(String[] args) {
         SpringApplication.run(ELibraryApplication.class, args);
     }

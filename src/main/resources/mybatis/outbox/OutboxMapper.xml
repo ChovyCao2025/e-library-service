@@ -1,65 +1,84 @@
 <?xml version="1.0" encoding="UTF-8" ?>
 <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
-<mapper namespace="com.elibrary.shared.outbox.OutboxMapper">
-  <!-- Outbox 查詢使用顯式欄位，避免資料表演進影響 Record 映射順序。 -->
+<mapper namespace="com.elibrary.shared.outbox.infrastructure.OutboxMapper">
+  <!-- Outbox 查询使用显式栏位，避免资料表演进造成非预期的属性映射。 -->
   <sql id="eventColumns">
     id, aggregate_type, aggregate_id, event_type, aggregate_version, payload, status,
     owner_token, lease_until, next_attempt_at, attempts, created_at, sent_at, last_error
   </sql>
 
-  <!-- 由聚合交易寫入；搜尋投遞目標在事件產生當下固定。 -->
+  <!-- 由聚合交易写入，确保业务异动与事件共同提交。 -->
   <insert id="insert">
     INSERT INTO outbox_event(
       id, aggregate_type, aggregate_id, event_type, aggregate_version, payload,
       status, next_attempt_at, attempts, created_at
     ) VALUES (
       #{id}, #{aggregateType}, #{aggregateId}, #{eventType}, #{aggregateVersion},
-      CAST(#{payload} AS JSON), 'NEW', #{now}, 0, #{now}
+      CAST(#{payload} AS JSON), #{status}, #{now}, 0, #{now}
     )
   </insert>
 
-  <insert id="insertSearchDeliveries">
-    INSERT INTO search_delivery(event_id, index_name, status, updated_at)
-    SELECT #{eventId}, index_name, 'PENDING', #{now}
-    FROM search_generation
-    WHERE state IN ('ACTIVE', 'BUILDING')
-  </insert>
-
-  <!-- Relay 以 SKIP LOCKED 分批認領，過期租約可由其他實例接管。 -->
-  <select id="lockReady" resultType="com.elibrary.shared.outbox.OutboxEventRow">
+  <!--
+    补偿任务锁定到达重试时间的 NEW 事件及租约已过期的 CLAIMED 事件。
+    SKIP LOCKED 让多个补偿实例跳过其他事务正在处理的数据行，避免相互等待。
+  -->
+  <select id="lockReady" resultType="com.elibrary.shared.outbox.infrastructure.OutboxEventRow">
     SELECT <include refid="eventColumns"/>
     FROM outbox_event
-    WHERE (status = 'NEW' AND next_attempt_at &lt;= #{now})
-       OR (status = 'CLAIMED' AND lease_until &lt; #{now})
+    WHERE (status = #{readyStatus} AND next_attempt_at &lt;= #{now})
+       OR (status = #{claimedStatus} AND lease_until &lt; #{now})
     ORDER BY id
     LIMIT #{limit}
     FOR UPDATE SKIP LOCKED
   </select>
 
   <update id="claim">
+    <!-- 数据行已由 lockReady 持有排他锁；同批事件写入相同 owner，随后按 owner 批量取回。 -->
     UPDATE outbox_event
-    SET status = 'CLAIMED', owner_token = #{owner}, lease_until = #{leaseUntil},
+    SET status = #{targetStatus}, owner_token = #{owner}, lease_until = #{leaseUntil},
         attempts = attempts + 1, last_error = NULL
     WHERE id = #{id}
   </update>
 
-  <select id="findClaimed" resultType="com.elibrary.shared.outbox.OutboxEventRow">
+  <!--
+    提交后直发通过单条条件 UPDATE 原子认领事件。
+    与补偿任务并发竞争时，只有成功更新状态和 owner_token 的一方可以继续发送。
+  -->
+  <update id="claimReady">
+    UPDATE outbox_event
+    SET status = #{targetStatus}, owner_token = #{owner}, lease_until = #{leaseUntil},
+        attempts = attempts + 1, last_error = NULL
+    WHERE id = #{id}
+      AND ((status = #{readyStatus} AND next_attempt_at &lt;= #{now})
+        OR (status = #{claimedStatus} AND lease_until &lt; #{now}))
+  </update>
+
+  <select id="findClaimed" resultType="com.elibrary.shared.outbox.infrastructure.OutboxEventRow">
     SELECT <include refid="eventColumns"/>
     FROM outbox_event
-    WHERE owner_token = #{owner} AND status = 'CLAIMED'
+    WHERE owner_token = #{owner} AND status = #{status}
     ORDER BY id
   </select>
 
+  <select id="findClaimedById" resultType="com.elibrary.shared.outbox.infrastructure.OutboxEventRow">
+    <!-- 同时校验事件、owner 和状态，确保只返回当前投递尝试实际持有的事件。 -->
+    SELECT <include refid="eventColumns"/>
+    FROM outbox_event
+    WHERE id = #{id} AND owner_token = #{owner} AND status = #{status}
+  </select>
+
   <update id="markSent">
+    <!-- owner_token 相当于租约令牌；旧 Worker 在租约被接管后无法将事件误标为 SENT。 -->
     UPDATE outbox_event
-    SET status = 'SENT', sent_at = #{now}, lease_until = NULL, owner_token = NULL
-    WHERE id = #{id} AND status = 'CLAIMED' AND owner_token = #{owner}
+    SET status = #{targetStatus}, sent_at = #{now}, lease_until = NULL, owner_token = NULL
+    WHERE id = #{id} AND status = #{expectedStatus} AND owner_token = #{owner}
   </update>
 
   <update id="reschedule">
+    <!-- 发布失败后恢复为 NEW 并清除租约；owner 条件阻止过期 Worker 覆盖新持有者。 -->
     UPDATE outbox_event
-    SET status = 'NEW', next_attempt_at = #{nextAttempt}, lease_until = NULL,
+    SET status = #{targetStatus}, next_attempt_at = #{nextAttempt}, lease_until = NULL,
         owner_token = NULL, last_error = #{error}
-    WHERE id = #{id} AND status = 'CLAIMED' AND owner_token = #{owner}
+    WHERE id = #{id} AND status = #{expectedStatus} AND owner_token = #{owner}
   </update>
 </mapper>

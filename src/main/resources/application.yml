@@ -1,3 +1,4 @@
+# E-Library 共用执行设定。敏感资讯与环境差异透过环境变数覆写。
 spring:
   application:
     name: e-library-service
@@ -10,15 +11,6 @@ spring:
       connection-timeout: 2000
   flyway:
     enabled: true
-  data:
-    redis:
-      host: ${REDIS_HOST:localhost}
-      port: ${REDIS_PORT:6379}
-      timeout: 100ms
-  cache:
-    type: caffeine
-    caffeine:
-      spec: maximumSize=10000,expireAfterWrite=5s
   jackson:
     default-property-inclusion: non_null
   mvc:
@@ -40,9 +32,6 @@ management:
     health:
       probes:
         enabled: true
-  health:
-    redis:
-      enabled: ${LENDING_REDIS_ENABLED:true}
 
 springdoc:
   swagger-ui:
@@ -58,21 +47,30 @@ app:
     max-active-loans: ${MAX_ACTIVE_LOANS:5}
     loan-days: ${LOAN_DAYS:14}
     policy-version: ${LOAN_POLICY_VERSION:v1}
-    attempt-lease: 30s
-    recovery-interval: 10s
     expiry-interval: 30s
     expiry-batch: 500
-    redis-enabled: ${LENDING_REDIS_ENABLED:true}
-    db-only-on-redis-failure: ${DB_ONLY_ON_REDIS_FAILURE:true}
   outbox:
-    interval: 200ms
     batch-size: 200
     lease: 30s
+    direct-threads: ${OUTBOX_DIRECT_THREADS:2}
+    direct-queue-capacity: ${OUTBOX_DIRECT_QUEUE_CAPACITY:500}
     rocketmq-enabled: ${ROCKETMQ_ENABLED:false}
     endpoints: ${ROCKETMQ_ENDPOINTS:localhost:8081}
-  cursor:
-    secret: ${CURSOR_SECRET:change-me-in-production-32-bytes-min}
-    ttl: 60s
+# XXL-JOB 仅扫描直发遗漏或重试到期的 Outbox 事件；本机预设不连接调度中心。
+xxl:
+  job:
+    enabled: ${XXL_JOB_ENABLED:false}
+    admin:
+      addresses: ${XXL_JOB_ADMIN_ADDRESSES:http://localhost:8088/xxl-job-admin}
+      access-token: ${XXL_JOB_ACCESS_TOKEN:}
+      timeout-seconds: ${XXL_JOB_ADMIN_TIMEOUT_SECONDS:3}
+    executor:
+      app-name: ${XXL_JOB_EXECUTOR_APP_NAME:e-library-outbox}
+      address: ${XXL_JOB_EXECUTOR_ADDRESS:}
+      ip: ${XXL_JOB_EXECUTOR_IP:}
+      port: ${XXL_JOB_EXECUTOR_PORT:9999}
+      log-path: ${XXL_JOB_LOG_PATH:./logs/xxl-job}
+      log-retention-days: ${XXL_JOB_LOG_RETENTION_DAYS:30}
 
 server:
   shutdown: graceful

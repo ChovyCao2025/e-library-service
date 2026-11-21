@@ -8,7 +8,7 @@
 
 E-Library 是一個以 Java 21 與 Spring Boot 4 建立的電子圖書館後端範例。專案採用模組化單體與分層架構，實作書目瀏覽、借閱、歸還、持久化冪等、庫存與使用者配額控制，以及交易式 Outbox。
 
-MySQL 保存權威業務狀態；Redis 只負責可重建的准入預占與投影加速，無法單獨建立成功借閱。
+MySQL 保存全部權威業務狀態；借閱、歸還、庫存、配額、冪等結果與 Outbox 均在本地交易中維護。
 
 > **範圍假設**
 >
@@ -18,11 +18,11 @@ MySQL 保存權威業務狀態；Redis 只負責可重建的准入預占與投�
 
 | 功能 | 狀態 | 說明 |
 | --- | --- | --- |
-| 瀏覽書籍 | 已完成 | 書名開頭查詢、分類、語言、格式篩選及簽章游標分頁 |
+| 瀏覽書籍 | 已完成 | 書名開頭查詢、分類、語言、格式篩選及 bookId 尋址分頁 |
 | 查詢書籍詳細資料 | 已完成 | 書目資料、出版資訊與目前可借數量 |
 | 借閱書籍 | 已完成 | 配額與庫存終裁、持久化冪等、同書重複借閱保護 |
 | 歸還書籍 | 已完成 | 手動與到期歸還，共用冪等交易流程 |
-| 查看目前借閱 | 已完成 | 依狀態查詢使用者借閱，支援游標分頁 |
+| 查看目前借閱 | 已完成 | 依狀態查詢使用者借閱，支援 loanId 尋址分頁 |
 | 管理書目與庫存 | 已完成 | 新增、樂觀鎖更新、上架、下架與調整借閱席位 |
 | 數位內容閱讀 | 範圍外 | 後續可加入短效內容授權 URL 與獨立內容服務 |
 
@@ -35,17 +35,20 @@ flowchart LR
     Web --> Lending[Lending Application]
     Catalog --> DB[(MySQL)]
     Lending --> DB
-    Lending -. 准入預占 .-> Redis[(Redis)]
-    DB --> Outbox[Outbox Relay]
-    Outbox --> MQ[RocketMQ / Logging Publisher]
+    DB --> Direct[afterCommit 快速投遞]
+    Direct --> MQ[RocketMQ / Logging Publisher]
+    XXL[XXL-JOB 調度中心] --> Compensation[Outbox 補償任務]
+    DB --> Compensation
+    Compensation --> MQ
 ```
 
 - `catalog`：書目、中繼資料、上架狀態與管理操作。
-- `lending`：借閱請求、庫存、使用者配額、Loan 與 Redis 投影。
-- `shared`：錯誤模型、身分上下文、游標、ID、設定與 Outbox。
+- `lending`：借閱請求、權威庫存、使用者配額與 Loan。
+- `shared`：錯誤模型、身分上下文、ID、設定與 Outbox。
 - `application` 編排用例與交易，`domain` 保存領域型別，`infrastructure` 實作資料庫及外部系統，`interfaces` 提供 HTTP API。
 
-完整說明請參閱 [架構文件](docs/architecture.md) 與 [API 文件](docs/api.md)。
+完整說明請參閱 [架構文件](docs/architecture.md)、[API 文件](docs/api.md) 與
+[效能基準](docs/performance/README.md)。
 
 ## 快速開始
 
@@ -57,7 +60,7 @@ flowchart LR
 ### 啟動依賴
 
 ```bash
-docker compose up -d mysql redis
+docker compose up -d mysql
 ```
 
 ### 啟動應用程式
@@ -108,7 +111,7 @@ curl "http://localhost:8080/api/v1/users/me/loans?status=BORROWED"
 curl -X POST "http://localhost:8080/api/v1/loans/LOAN_ID/return"
 ```
 
-首次借閱成功回傳 `201 Created`；相同冪等鍵與相同參數重送時回傳 `200 OK`，並附帶 `Idempotent-Replay: true`。
+業務 API 統一回傳 `200 OK`；首次借閱與冪等重放都回傳 `code: 0000`，重放另附帶 `Idempotent-Replay: true`。
 
 開發模式預設使用者為 `10001`。可用下列受信任標頭模擬其他身分：
 
@@ -133,10 +136,12 @@ X-Role: ADMIN
 │   ├── catalog/                  # 書目邊界上下文
 │   ├── lending/                  # 借閱邊界上下文
 │   └── shared/                   # 共用技術能力
+│       ├── kernel/               # 設定、時間與識別碼
+│       ├── outbox/               # 交易式事件的領域、應用及基礎設施
+│       └── web/                  # API、錯誤處理及可信身分
 ├── src/main/resources/
 │   ├── db/migration/             # Flyway 版本化遷移
-│   ├── mybatis/                  # MyBatis XML SQL
-│   └── redis/                    # 原子預占 Lua 腳本
+│   └── mybatis/                  # MyBatis XML SQL
 ├── src/test/                     # 單元、架構與 Testcontainers 測試
 ├── compose.yaml                  # 本地基礎設施
 ├── Dockerfile                    # 多階段應用映像
@@ -147,13 +152,14 @@ X-Role: ADMIN
 ## 核心工程決策
 
 1. **模組化單體**：題目規模適合單一部署單元；依業務上下文分包，保留未來拆分邊界。
-2. **MySQL 最終裁決**：Redis 預占只降低無效競爭，資料庫條件更新與唯一鍵維護業務不變量。
+2. **MySQL 單一權威**：條件更新、資料列鎖、唯一鍵與 CHECK constraint 共同維護業務不變量。
 3. **持久化冪等**：`(userId, Idempotency-Key)` 對應穩定 requestId 與 loanId，回應遺失後仍可安全重放。
 4. **固定鎖順序**：借閱與歸還採相同資源鎖順序，降低死鎖循環風險。
-5. **交易式 Outbox**：業務資料與事件共同提交，外部訊息傳送位於交易之外。
+5. **交易式 Outbox**：業務資料與事件共同提交；提交後立即非同步投遞，XXL-JOB 掃描遺漏與重試事件。
 6. **MyBatis XML**：Mapper 介面只保存方法契約；SQL 採顯式欄位清單，並由架構測試禁止行內 SQL 註解。
-7. **簽章游標**：查詢指紋、頁面大小與有效期限均納入 HMAC，避免游標被竄改或跨查詢重用。
-8. **REST 回應語義**：成功直接回傳資源 DTO，錯誤統一為 Problem Details，避免建立重複 HTTP 狀態的通用包裝層。
+7. **簡單尋址分頁**：書目與借閱列表直接使用上一頁最後一筆 ID，保留穩定分頁且避免額外協議複雜度。
+8. **統一 API 回應**：業務端點一律回傳 `Resp<T>`，HTTP 傳輸狀態統一為 `200 OK`，呼叫端依 `code` 判斷業務結果。
+9. **受控使用 Lombok**：只生成依賴注入構造器與存取方法；領域校驗、設定預設值及外部客戶端初始化仍使用顯式程式碼。
 
 ## 設定
 
@@ -163,13 +169,27 @@ X-Role: ADMIN
 | --- | --- | --- |
 | `DB_URL` | 本機 `elibrary` MySQL | JDBC 連線字串 |
 | `DB_USERNAME` / `DB_PASSWORD` | `elibrary` | 資料庫帳號與密碼 |
-| `REDIS_HOST` / `REDIS_PORT` | `localhost` / `6379` | Redis 預占與投影 |
 | `APP_ROLE` | `all` | `api`、`worker` 或 `all` |
-| `LENDING_REDIS_ENABLED` | `true` | 啟用 Redis 准入與投影重建 |
-| `DB_ONLY_ON_REDIS_FAILURE` | `true` | Redis 故障時允許資料庫路徑 |
 | `DEV_AUTH_ENABLED` | `true` | 啟用本機開發身分 |
-| `CURSOR_SECRET` | 開發值 | 游標 HMAC 金鑰，非本機環境必須替換 |
 | `ROCKETMQ_ENABLED` | `false` | 啟用 RocketMQ 發布器 |
+| `XXL_JOB_ENABLED` | `false` | 啟用 Outbox 補償執行器 |
+| `XXL_JOB_ADMIN_ADDRESSES` | 本機 `8088` | XXL-JOB 調度中心位址 |
+
+### Outbox 補償任務
+
+正常路徑在業務交易提交後，透過有界執行緒池認領該筆事件並立即發布。執行緒池飽和、RocketMQ 發送失敗或程序中途終止時，事件仍保存在 MySQL；租約到期後可由補償任務重新認領。
+
+生產或整合環境需部署 XXL-JOB 調度中心，設定 `XXL_JOB_ENABLED=true` 與調度中心位址，並建立以下任務：
+
+| 設定 | 值 |
+| --- | --- |
+| 執行器 AppName | `e-library-outbox`，或 `XXL_JOB_EXECUTOR_APP_NAME` 的實際值 |
+| JobHandler | `outboxCompensationJob` |
+| 建議排程 | 每 5 秒一次，依積壓量與資料庫容量調整 |
+
+執行器預設監聽 `9999`；容器或反向代理環境需讓調度中心可以存取該連接埠，並透過 `XXL_JOB_EXECUTOR_ADDRESS` 提供調度中心實際可達的位址。`APP_ROLE` 使用 `all` 或 `worker` 時才會執行補償。
+
+直發與補償均先寫入唯一 owner 租約，並以 owner 條件確認 `SENT`，因此同一時刻只有一條路徑持有事件。發送成功後、狀態回寫前發生故障時仍可能重複投遞，下游消費者需以 `eventId` 去重。
 
 ## 建置與測試
 
@@ -179,19 +199,18 @@ X-Role: ADMIN
 
 測試分為：
 
-- 單元測試：冪等鍵、請求指紋、游標與 ID 產生器。
+- 單元測試：書目領域值物件、冪等鍵與 ID 產生器。
 - 架構測試：領域層依賴規則，以及禁止 MyBatis 行內 SQL 註解。
 - MySQL 整合測試：使用 Testcontainers 驗證借閱重放、售罄、重複歸還與計數不變量。
 - 負載冒煙：`k6 run load-tests/k6-smoke.js`。
 
-最近一次本機驗證共有 9 項測試，8 項通過；Docker 未執行，因此 MySQL Testcontainers 測試依設定跳過。另外使用獨立 MySQL 8.0.22 完成 Flyway、HTTP 借閱、重放、歸還及庫存不變量冒煙驗證。此結果只代表已測試的版本與路徑。
+MySQL 整合測試需要可用的 Docker 環境，缺少 Docker 時會依 Testcontainers 設定跳過。
 
 ## 已知限制
 
 - 數位正文、閱讀器、內容授權與 DRM 尚未實作。
-- 目前書目搜尋使用 MySQL 書名前綴；Elasticsearch 消費者與 PIT/search-after 尚未實作。
-- Redis Cluster 與 RocketMQ 真實服務整合仍需在具備完整基礎設施的環境驗收。
-- 搜尋重建資料表已建立，完整索引重建工作流程仍屬後續工作。
+- 目前書目查詢由 MySQL 承擔，僅支援既有篩選條件與書名前綴查找。
+- RocketMQ、XXL-JOB 真實服務整合仍需在具備完整基礎設施的環境驗收。
 
 ## 參與開發
 
