@@ -54,6 +54,14 @@
     LIMIT #{limit}
   </select>
 
+  <select id="scanForSearch" resultType="com.elibrary.catalog.infrastructure.BookRow">
+    SELECT <include refid="lockedBookColumns"/>
+    FROM book b
+    WHERE b.book_id &gt; #{afterId}
+    ORDER BY b.book_id
+    LIMIT #{limit}
+  </select>
+
   <!-- 书目写入必须与 Outbox 事件位于同一个应用层交易。 -->
   <insert id="insertBook">
     INSERT INTO book(

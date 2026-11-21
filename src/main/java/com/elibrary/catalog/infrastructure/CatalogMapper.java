@@ -25,6 +25,8 @@ public interface CatalogMapper {
                          @Param("status") BookStatus status,
                          @Param("afterId") long afterId, @Param("limit") int limit);
 
+    List<BookRow> scanForSearch(@Param("afterId") long afterId, @Param("limit") int limit);
+
     // 书目异动。
     int insertBook(@Param("bookId") long bookId, @Param("metadata") BookMetadata metadata,
                    @Param("status") BookStatus status, @Param("now") LocalDateTime now);

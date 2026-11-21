@@ -53,6 +53,11 @@ GET /books?q=Demo&categoryId=1&language=en&format=EBOOK&size=20
 
 只回傳 `PUBLISHED` 書籍。
 
+`SEARCH_ENABLED=false` 時所有條件由 MySQL 查詢。`SEARCH_ENABLED=true` 且 `q` 有值時，
+Elasticsearch 依標準化書名前綴、可選篩選條件及 `bookId` 排序查詢；Lending MySQL 再以本頁
+書籍 ID 批量補上即時庫存。Elasticsearch 暫時無法服務時回傳可重試的
+`SEARCH_UNAVAILABLE`，避免大量搜尋直接壓回 MySQL。
+
 ### 查詢書籍詳細資料
 
 ```http
@@ -177,3 +182,4 @@ Content-Type: application/json
 | `LOAN_LIMIT_EXCEEDED` | 已達使用者借閱上限 |
 | `VERSION_CONFLICT` | 書目版本或狀態遷移條件已改變 |
 | `IDEMPOTENCY_KEY_REUSED` | 冪等鍵被用於其他書籍 |
+| `SEARCH_UNAVAILABLE` | Elasticsearch 搜尋投影暫時無法查詢，可重試 |

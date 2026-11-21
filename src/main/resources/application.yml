@@ -16,6 +16,10 @@ spring:
   mvc:
     problemdetails:
       enabled: false
+  elasticsearch:
+    uris: ${ELASTICSEARCH_URIS:http://localhost:9200}
+    connection-timeout: ${ELASTICSEARCH_CONNECTION_TIMEOUT:1s}
+    socket-timeout: ${ELASTICSEARCH_SOCKET_TIMEOUT:3s}
 
 mybatis:
   mapper-locations: classpath*:/mybatis/**/*.xml
@@ -56,6 +60,18 @@ app:
     direct-queue-capacity: ${OUTBOX_DIRECT_QUEUE_CAPACITY:500}
     rocketmq-enabled: ${ROCKETMQ_ENABLED:false}
     endpoints: ${ROCKETMQ_ENDPOINTS:localhost:8081}
+  search:
+    enabled: ${SEARCH_ENABLED:false}
+    rebuild-on-startup: ${SEARCH_REBUILD_ON_STARTUP:false}
+    consumer-enabled: ${SEARCH_CONSUMER_ENABLED:false}
+    physical-index: ${SEARCH_PHYSICAL_INDEX:catalog-book-v1-000001}
+    read-alias: ${SEARCH_READ_ALIAS:catalog-book-read}
+    write-alias: ${SEARCH_WRITE_ALIAS:catalog-book-write}
+    consumer-group: ${SEARCH_CONSUMER_GROUP:catalog-search-indexer}
+    batch-size: ${SEARCH_BATCH_SIZE:500}
+    poll-interval: ${SEARCH_POLL_INTERVAL:1s}
+    await-duration: ${SEARCH_AWAIT_DURATION:5s}
+    invisible-duration: ${SEARCH_INVISIBLE_DURATION:30s}
 # XXL-JOB 仅扫描直发遗漏或重试到期的 Outbox 事件；本机预设不连接调度中心。
 xxl:
   job:

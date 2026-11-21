@@ -77,6 +77,15 @@
     WHERE book_id = #{bookId}
   </select>
 
+  <select id="findStocks" resultType="com.elibrary.lending.infrastructure.LendingStockRow">
+    SELECT book_id, total_copies, available_copies, version, updated_at
+    FROM lending_stock
+    WHERE book_id IN
+    <foreach collection="bookIds" item="bookId" open="(" separator="," close=")">
+      #{bookId}
+    </foreach>
+  </select>
+
   <select id="lockStock" resultType="integer">
     SELECT available_copies
     FROM lending_stock

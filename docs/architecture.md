@@ -48,6 +48,7 @@ com.elibrary
 | 元件 | 職責 | 是否權威 |
 | --- | --- | --- |
 | MySQL | 書目、庫存、使用者配額、借閱、冪等請求、Outbox | 是 |
+| Elasticsearch | 可重建的書目搜尋投影 | 否 |
 | RocketMQ | 已提交事件的非同步傳遞 | 否 |
 
 借閱成功只由 MySQL 交易提交決定。應用程式不維護第二份可寫庫存，也不需要快取重建、代次切換或跨資料源補償。
@@ -153,7 +154,24 @@ XXL-JOB 的 `outboxCompensationJob` 定期掃描到期的 `NEW` 事件與租約�
 
 這是至少一次投遞；事件可能在「已送出、尚未回寫」時重複，因此下游必須以 eventId 去重。
 
-## 8. API 與錯誤
+## 8. Elasticsearch 搜尋投影
+
+書目列表採混合查詢：未提供 `q` 時沿用 MySQL 的 `status + book_id` 尋址分頁；提供 `q`
+且啟用搜尋功能時，由 Elasticsearch 執行標準化書名前綴及分類、語言、格式篩選，排序固定為
+`bookId` 遞增並以 `search_after` 延續現有 `nextBookId` 協議。
+
+Elasticsearch 文件只保存 Catalog 書目欄位。搜尋取得一頁書籍後，應用程式以一條
+`lending_stock WHERE book_id IN (...)` 查詢補上即時庫存，ES 不保存庫存事實。
+
+索引使用 `catalog-book-v1-000001` 版本化實體名稱及 `catalog-book-read`、
+`catalog-book-write` 別名。首次啟用可由 MySQL 依 `book_id` 分批回填；後續
+`BookCreated/BookUpdated/BookPublished/BookOfflined` 經 Outbox 與 RocketMQ 投遞給搜尋
+消費者。寫入採 `aggregateVersion` 外部版本控制，重複事件可重放，較舊事件無法覆蓋較新文件。
+
+搜尋開關預設關閉。開啟後，ES 故障回傳可重試的 `SEARCH_UNAVAILABLE`，保護已確認會在
+大資料量下超時的 MySQL 前綴查詢。普通瀏覽、詳情、借閱狀態終裁及所有寫入仍由 MySQL 提供。
+
+## 9. API 與錯誤
 
 - 外部 ID 以 JSON 字串傳遞，避免 JavaScript 整數精度問題。
 - 時間使用 UTC ISO-8601。
@@ -162,7 +180,7 @@ XXL-JOB 的 `outboxCompensationJob` 定期掃描到期的 `NEW` 事件與租約�
 - 應用程式已處理的業務請求統一回傳 `200 OK`，呼叫端依 `code` 判斷業務結果。
 - 正式環境身分由受信任閘道注入；開發模式才接受預設模擬身分。
 
-## 9. 主要取捨
+## 10. 主要取捨
 
 | 決策 | 收益 | 成本 |
 | --- | --- | --- |
@@ -172,11 +190,13 @@ XXL-JOB 的 `outboxCompensationJob` 定期掃描到期的 `NEW` 事件與租約�
 | 持久化冪等 | 回應遺失後可安全重放 | 增加請求資料生命週期管理 |
 | MyBatis XML | SQL 可審查、介面乾淨 | Java 與 XML 需要同步維護 |
 | Outbox + XXL-JOB 補償 | 避免資料已提交但事件遺失 | 下游需處理重複事件，部署需維護調度中心 |
+| Elasticsearch 搜尋投影 | 百萬級前綴查詢不掃描 MySQL 書目表 | 增加回填、消費延遲、重建與叢集維運成本 |
 
-## 10. 後續演進
+## 11. 後續演進
 
 1. 以正式流量資料觀察 `lending_stock` 與 `user_lending_account` 的鎖等待。
 2. 只有在資料證明單列競爭成為瓶頸後，再比較排隊、分片或其他准入方案。
 3. 加入內容授權服務，針對有效 Loan 簽發短效閱讀 URL。
-4. 在 RocketMQ + Proxy 環境驗證發送回執、重複與重試。
-5. 增加併發、死鎖重試、故障注入及完整 HTTP 整合測試。
+4. 在 RocketMQ + Proxy 環境驗證搜尋消費積壓、重複、亂序與重試。
+5. 依產品搜尋語義評估多語言分析器、相關性排序及模糊搜尋。
+6. 增加併發、死鎖重試、故障注入及完整 HTTP 整合測試。

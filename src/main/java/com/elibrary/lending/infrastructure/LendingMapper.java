@@ -42,6 +42,8 @@ public interface LendingMapper {
 
     LendingStockRow findStock(@Param("bookId") long bookId);
 
+    List<LendingStockRow> findStocks(@Param("bookIds") List<Long> bookIds);
+
     Integer lockStock(@Param("bookId") long bookId);
 
     int occupyStock(@Param("bookId") long bookId, @Param("now") LocalDateTime now);

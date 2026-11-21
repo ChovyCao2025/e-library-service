@@ -20,6 +20,7 @@ public class AppProperties {
     private Auth auth = new Auth();
     private Lending lending = new Lending();
     private Outbox outbox = new Outbox();
+    private Search search = new Search();
     private int nodeId;
 
     public AppProperties(ApplicationRole role, Auth auth, Lending lending, Outbox outbox, int nodeId) {
@@ -37,6 +38,7 @@ public class AppProperties {
     public void setAuth(Auth auth) { this.auth = auth == null ? new Auth() : auth; }
     public void setLending(Lending lending) { this.lending = lending == null ? new Lending() : lending; }
     public void setOutbox(Outbox outbox) { this.outbox = outbox == null ? new Outbox() : outbox; }
+    public void setSearch(Search search) { this.search = search == null ? new Search() : search; }
 
     public void setNodeId(int nodeId) {
         this.nodeId = Math.max(MIN_NODE_ID, Math.min(nodeId, MAX_NODE_ID));
@@ -117,6 +119,68 @@ public class AppProperties {
         public void setDirectQueueCapacity(int directQueueCapacity) {
             this.directQueueCapacity = directQueueCapacity <= 0
                     ? DEFAULT_DIRECT_QUEUE_CAPACITY : directQueueCapacity;
+        }
+    }
+
+    /** Elasticsearch 书目搜索、回填和消息消费设定。 */
+    @Getter
+    @NoArgsConstructor
+    public static class Search {
+        private static final String DEFAULT_PHYSICAL_INDEX = "catalog-book-v1-000001";
+        private static final String DEFAULT_READ_ALIAS = "catalog-book-read";
+        private static final String DEFAULT_WRITE_ALIAS = "catalog-book-write";
+        private static final String DEFAULT_CONSUMER_GROUP = "catalog-search-indexer";
+        private static final int DEFAULT_BATCH_SIZE = 500;
+        private static final Duration DEFAULT_POLL_INTERVAL = Duration.ofSeconds(1);
+        private static final Duration DEFAULT_AWAIT_DURATION = Duration.ofSeconds(5);
+        private static final Duration DEFAULT_INVISIBLE_DURATION = Duration.ofSeconds(30);
+
+        @Setter
+        private boolean enabled;
+        @Setter
+        private boolean rebuildOnStartup;
+        @Setter
+        private boolean consumerEnabled;
+        private String physicalIndex = DEFAULT_PHYSICAL_INDEX;
+        private String readAlias = DEFAULT_READ_ALIAS;
+        private String writeAlias = DEFAULT_WRITE_ALIAS;
+        private String consumerGroup = DEFAULT_CONSUMER_GROUP;
+        private int batchSize = DEFAULT_BATCH_SIZE;
+        private Duration pollInterval = DEFAULT_POLL_INTERVAL;
+        private Duration awaitDuration = DEFAULT_AWAIT_DURATION;
+        private Duration invisibleDuration = DEFAULT_INVISIBLE_DURATION;
+
+        public void setPhysicalIndex(String physicalIndex) {
+            this.physicalIndex = defaultIfBlank(physicalIndex, DEFAULT_PHYSICAL_INDEX);
+        }
+        public void setReadAlias(String readAlias) {
+            this.readAlias = defaultIfBlank(readAlias, DEFAULT_READ_ALIAS);
+        }
+        public void setWriteAlias(String writeAlias) {
+            this.writeAlias = defaultIfBlank(writeAlias, DEFAULT_WRITE_ALIAS);
+        }
+        public void setConsumerGroup(String consumerGroup) {
+            this.consumerGroup = defaultIfBlank(consumerGroup, DEFAULT_CONSUMER_GROUP);
+        }
+        public void setBatchSize(int batchSize) {
+            this.batchSize = batchSize <= 0 ? DEFAULT_BATCH_SIZE : batchSize;
+        }
+        public void setPollInterval(Duration pollInterval) {
+            this.pollInterval = defaultDuration(pollInterval, DEFAULT_POLL_INTERVAL);
+        }
+        public void setAwaitDuration(Duration awaitDuration) {
+            this.awaitDuration = defaultDuration(awaitDuration, DEFAULT_AWAIT_DURATION);
+        }
+        public void setInvisibleDuration(Duration invisibleDuration) {
+            this.invisibleDuration = defaultDuration(invisibleDuration, DEFAULT_INVISIBLE_DURATION);
+        }
+
+        private static String defaultIfBlank(String value, String defaultValue) {
+            return value == null || value.isBlank() ? defaultValue : value.strip();
+        }
+
+        private static Duration defaultDuration(Duration value, Duration defaultValue) {
+            return value == null || value.isNegative() || value.isZero() ? defaultValue : value;
         }
     }
 }

@@ -4,6 +4,7 @@
 ![Java](https://img.shields.io/badge/Java-21-ED8B00)
 ![Spring Boot](https://img.shields.io/badge/Spring%20Boot-4.0.9-6DB33F)
 ![MySQL](https://img.shields.io/badge/MySQL-8.4-4479A1)
+![Elasticsearch](https://img.shields.io/badge/Elasticsearch-9.2-005571)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
 E-Library 是一個以 Java 21 與 Spring Boot 4 建立的電子圖書館後端範例。專案採用模組化單體與分層架構，實作書目瀏覽、借閱、歸還、持久化冪等、庫存與使用者配額控制，以及交易式 Outbox。
@@ -18,7 +19,7 @@ MySQL 保存全部權威業務狀態；借閱、歸還、庫存、配額、冪�
 
 | 功能 | 狀態 | 說明 |
 | --- | --- | --- |
-| 瀏覽書籍 | 已完成 | 書名開頭查詢、分類、語言、格式篩選及 bookId 尋址分頁 |
+| 瀏覽書籍 | 已完成 | 可選 Elasticsearch 書名前綴搜尋、分類、語言、格式篩選及 bookId 尋址分頁 |
 | 查詢書籍詳細資料 | 已完成 | 書目資料、出版資訊與目前可借數量 |
 | 借閱書籍 | 已完成 | 配額與庫存終裁、持久化冪等、同書重複借閱保護 |
 | 歸還書籍 | 已完成 | 手動與到期歸還，共用冪等交易流程 |
@@ -34,12 +35,15 @@ flowchart LR
     Web --> Catalog[Catalog Application]
     Web --> Lending[Lending Application]
     Catalog --> DB[(MySQL)]
+    Catalog --> ES[(Elasticsearch 搜尋投影)]
     Lending --> DB
     DB --> Direct[afterCommit 快速投遞]
     Direct --> MQ[RocketMQ / Logging Publisher]
     XXL[XXL-JOB 調度中心] --> Compensation[Outbox 補償任務]
     DB --> Compensation
     Compensation --> MQ
+    MQ --> Indexer[Catalog 搜尋消費者]
+    Indexer --> ES
 ```
 
 - `catalog`：書目、中繼資料、上架狀態與管理操作。
@@ -61,6 +65,22 @@ flowchart LR
 
 ```bash
 docker compose up -d mysql
+```
+
+啟用 Elasticsearch 搜尋及首次回填：
+
+```powershell
+docker compose --profile search up -d mysql elasticsearch
+$env:SEARCH_ENABLED = "true"
+$env:SEARCH_REBUILD_ON_STARTUP = "true"
+.\mvnw.cmd spring-boot:run
+```
+
+回填完成後將 `SEARCH_REBUILD_ON_STARTUP` 設回 `false`。持續同步管理端書目異動時，同時啟動
+RocketMQ，並設定 `ROCKETMQ_ENABLED=true` 與 `SEARCH_CONSUMER_ENABLED=true`：
+
+```powershell
+docker compose --profile search --profile mq up -d
 ```
 
 ### 啟動應用程式
@@ -160,6 +180,7 @@ X-Role: ADMIN
 7. **簡單尋址分頁**：書目與借閱列表直接使用上一頁最後一筆 ID，保留穩定分頁且避免額外協議複雜度。
 8. **統一 API 回應**：業務端點一律回傳 `Resp<T>`，HTTP 傳輸狀態統一為 `200 OK`，呼叫端依 `code` 判斷業務結果。
 9. **受控使用 Lombok**：只生成依賴注入構造器與存取方法；領域校驗、設定預設值及外部客戶端初始化仍使用顯式程式碼。
+10. **可重建搜尋投影**：有 `q` 的書目搜尋使用 Elasticsearch；MySQL 保存權威書目與即時庫存，Outbox 事件按書目版本更新索引。
 
 ## 設定
 
@@ -172,6 +193,10 @@ X-Role: ADMIN
 | `APP_ROLE` | `all` | `api`、`worker` 或 `all` |
 | `DEV_AUTH_ENABLED` | `true` | 啟用本機開發身分 |
 | `ROCKETMQ_ENABLED` | `false` | 啟用 RocketMQ 發布器 |
+| `SEARCH_ENABLED` | `false` | 將帶 `q` 的書目搜尋切換至 Elasticsearch |
+| `SEARCH_REBUILD_ON_STARTUP` | `false` | 啟動時以 MySQL 全量回填版本化索引 |
+| `SEARCH_CONSUMER_ENABLED` | `false` | 消費 Catalog MQ 事件並持續更新搜尋投影 |
+| `ELASTICSEARCH_URIS` | `http://localhost:9200` | Elasticsearch 節點位址 |
 | `XXL_JOB_ENABLED` | `false` | 啟用 Outbox 補償執行器 |
 | `XXL_JOB_ADMIN_ADDRESSES` | 本機 `8088` | XXL-JOB 調度中心位址 |
 
@@ -202,15 +227,16 @@ X-Role: ADMIN
 - 單元測試：書目領域值物件、冪等鍵與 ID 產生器。
 - 架構測試：領域層依賴規則，以及禁止 MyBatis 行內 SQL 註解。
 - MySQL 整合測試：使用 Testcontainers 驗證借閱重放、售罄、重複歸還與計數不變量。
+- 搜尋整合測試：使用真實 MySQL 與 Elasticsearch 驗證回填、前綴查詢、庫存組裝及外部版本幂等。
 - 負載冒煙：`k6 run load-tests/k6-smoke.js`。
 
-MySQL 整合測試需要可用的 Docker 環境，缺少 Docker 時會依 Testcontainers 設定跳過。
+MySQL 與 Elasticsearch 整合測試需要可用的 Docker 環境，缺少 Docker 時會依 Testcontainers 設定跳過。
 
 ## 已知限制
 
 - 數位正文、閱讀器、內容授權與 DRM 尚未實作。
-- 目前書目查詢由 MySQL 承擔，僅支援既有篩選條件與書名前綴查找。
-- RocketMQ、XXL-JOB 真實服務整合仍需在具備完整基礎設施的環境驗收。
+- Elasticsearch 目前維持書名開頭比對語義；相關性、多語言分析器與模糊搜尋屬於後續搜尋能力。
+- RocketMQ、XXL-JOB 聯合故障與積壓恢復仍需在完整基礎設施環境驗收。
 
 ## 參與開發
 

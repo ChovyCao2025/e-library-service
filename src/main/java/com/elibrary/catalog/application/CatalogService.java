@@ -7,6 +7,7 @@ import com.elibrary.catalog.infrastructure.BookRow;
 import com.elibrary.catalog.infrastructure.CatalogMapper;
 import com.elibrary.catalog.interfaces.BookDtos;
 import com.elibrary.lending.application.LendingInventoryService;
+import com.elibrary.lending.application.LendingStockReader;
 import com.elibrary.shared.kernel.ClockProvider;
 import com.elibrary.shared.kernel.SnowflakeIdGenerator;
 import com.elibrary.shared.outbox.application.OutboxWriter;
@@ -17,6 +18,7 @@ import com.elibrary.shared.web.error.DomainException;
 import tools.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import org.springframework.dao.DuplicateKeyException;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -38,6 +40,8 @@ public class CatalogService {
     private final SnowflakeIdGenerator idGenerator;
     private final ClockProvider clock;
     private final ObjectMapper objectMapper;
+    private final ObjectProvider<BookSearchReader> searchReaderProvider;
+    private final LendingStockReader stockReader;
 
     /**
      * 依识别码取得书目。公开查询会隐藏未上架资料，内部呼叫端可明确要求包含其他状态。
@@ -67,6 +71,12 @@ public class CatalogService {
         BookFormat normalizedFormat = BookFormat.fromNullable(format);
         long afterId = afterBookId == null ? 0L : afterBookId;
 
+        BookSearchReader searchReader = searchReaderProvider.getIfAvailable();
+        if (!normalizedQuery.isEmpty() && searchReader != null) {
+            return browseSearch(searchReader, normalizedQuery, categoryId, language,
+                    normalizedFormat, afterId, size);
+        }
+
         // 多读取一笔即可判断是否仍有下一页，不需要额外执行 COUNT 查询。
         List<BookRow> rows = mapper.browse(
                 normalizedQuery, categoryId, language, normalizedFormat,
@@ -85,6 +95,41 @@ public class CatalogService {
                 ? Long.toUnsignedString(rows.getLast().getBookId())
                 : null;
         return new BookDtos.BookPage(items, nextBookId, hasMore);
+    }
+
+    private BookDtos.BookPage browseSearch(BookSearchReader searchReader, String query,
+                                           Long categoryId, String language, BookFormat format,
+                                           long afterId, int size) {
+        try {
+            var searchQuery = new BookSearchReader.BookSearchQuery(
+                    query, categoryId, language, format, afterId);
+            var matches = searchReader.search(searchQuery, size + 1);
+            boolean hasMore = matches.size() > size;
+            if (hasMore) {
+                matches = matches.subList(0, size);
+            }
+
+            var bookIds = matches.stream().map(BookSearchReader.BookSearchView::bookId).toList();
+            var stocks = stockReader.findByBookIds(bookIds);
+            var now = clock.now();
+            var items = matches.stream().map(book -> {
+                var stock = stocks.get(book.bookId());
+                BookDtos.Availability availability = stock == null ? null
+                        : new BookDtos.Availability(stock.availableCopies(), stock.totalCopies(), now,
+                        BookDtos.AvailabilitySource.DATABASE);
+                return new BookDtos.BookResponse(Long.toUnsignedString(book.bookId()), book.isbn(), book.title(),
+                        book.subtitle(), book.authors(), book.publisher(),
+                        Long.toUnsignedString(book.categoryId()), book.language(), book.description(),
+                        book.coverUrl(), book.publishedDate(), book.format(), book.status(),
+                        book.version(), availability);
+            }).toList();
+            String nextBookId = hasMore
+                    ? Long.toUnsignedString(matches.getLast().bookId())
+                    : null;
+            return new BookDtos.BookPage(items, nextBookId, hasMore);
+        } catch (BookSearchUnavailableException exception) {
+            throw DomainException.of(ErrorCode.SEARCH_UNAVAILABLE, true, null);
+        }
     }
 
     /** 建立草稿书目及其零容量库存，并在同一交易写入 BookCreated 事件。 */

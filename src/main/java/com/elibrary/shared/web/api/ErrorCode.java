@@ -34,6 +34,7 @@ public enum ErrorCode {
             "Idempotency-Key was already used for another book"),
 
     RATE_LIMITED("RATE_LIMITED", "Too many requests"),
+    SEARCH_UNAVAILABLE("SEARCH_UNAVAILABLE", "Catalog search is temporarily unavailable"),
     INTERNAL_ERROR("INTERNAL_ERROR", "An unexpected error occurred");
 
     /** 对外传输且不可随意变更的业务码。 */
