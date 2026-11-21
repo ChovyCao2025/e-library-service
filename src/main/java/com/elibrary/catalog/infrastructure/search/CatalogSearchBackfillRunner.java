@@ -33,18 +33,24 @@ public class CatalogSearchBackfillRunner implements ApplicationRunner {
             return;
         }
         indexManager.ensureIndex();
-        long afterId = 0;
-        long indexed = 0;
-        int batchSize = properties.getSearch().getBatchSize();
-        while (true) {
-            List<BookRow> rows = mapper.scanForSearch(afterId, batchSize);
-            if (rows.isEmpty()) {
-                break;
+        writer.setRefreshInterval("-1");
+        long indexed;
+        try {
+            long afterId = 0;
+            indexed = 0;
+            int batchSize = properties.getSearch().getBatchSize();
+            while (true) {
+                List<BookRow> rows = mapper.scanForSearch(afterId, batchSize);
+                if (rows.isEmpty()) {
+                    break;
+                }
+                writer.upsertAll(rows.stream().map(row -> BookSearchDocument.from(row, objectMapper)).toList());
+                indexed += rows.size();
+                afterId = rows.getLast().getBookId();
+                log.info("Catalog search backfill indexed {} books", indexed);
             }
-            writer.upsertAll(rows.stream().map(row -> BookSearchDocument.from(row, objectMapper)).toList());
-            indexed += rows.size();
-            afterId = rows.getLast().getBookId();
-            log.info("Catalog search backfill indexed {} books", indexed);
+        } finally {
+            writer.setRefreshInterval("1s");
         }
         writer.refresh();
         log.info("Catalog search backfill completed with {} books", indexed);

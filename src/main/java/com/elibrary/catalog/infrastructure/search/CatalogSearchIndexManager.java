@@ -2,6 +2,7 @@ package com.elibrary.catalog.infrastructure.search;
 
 import co.elastic.clients.elasticsearch.ElasticsearchClient;
 import co.elastic.clients.elasticsearch._types.mapping.DynamicMapping;
+import co.elastic.clients.elasticsearch.indices.SegmentSortOrder;
 import com.elibrary.shared.kernel.AppProperties;
 import lombok.RequiredArgsConstructor;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -28,14 +29,25 @@ public class CatalogSearchIndexManager {
             if (!exists) {
                 client.indices().create(c -> c
                         .index(search.getPhysicalIndex())
-                        .settings(s -> s.numberOfShards("1").numberOfReplicas("0"))
+                        .settings(s -> s
+                                .numberOfShards("1")
+                                .numberOfReplicas("0")
+                                .sort(sort -> sort
+                                        .field("bookIdSort")
+                                        .order(SegmentSortOrder.Asc)))
                         .mappings(m -> m
                                 .dynamic(DynamicMapping.Strict)
                                 .properties("bookId", p -> p.keyword(k -> k))
                                 .properties("bookIdSort", p -> p.long_(n -> n))
                                 .properties("isbn", p -> p.keyword(k -> k.ignoreAbove(64)))
                                 .properties("title", p -> p.text(t -> t))
-                                .properties("titlePrefix", p -> p.keyword(k -> k.ignoreAbove(256)))
+                                .properties("titlePrefix", p -> p.text(t -> t
+                                        .analyzer("keyword")
+                                        .searchAnalyzer("keyword")
+                                        .norms(false)
+                                        .indexPrefixes(prefixes -> prefixes
+                                                .minChars(1)
+                                                .maxChars(19))))
                                 .properties("subtitle", p -> p.text(t -> t))
                                 .properties("authors", p -> p.text(t -> t))
                                 .properties("publisher", p -> p.text(t -> t))

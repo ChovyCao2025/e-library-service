@@ -1,5 +1,7 @@
 package com.elibrary;
 
+import co.elastic.clients.elasticsearch.ElasticsearchClient;
+import co.elastic.clients.elasticsearch.indices.SegmentSortOrder;
 import com.elibrary.catalog.application.CatalogService;
 import com.elibrary.catalog.infrastructure.CatalogMapper;
 import com.elibrary.catalog.infrastructure.search.BookSearchDocument;
@@ -52,6 +54,7 @@ class CatalogSearchIntegrationTest {
     @Autowired CatalogMapper mapper;
     @Autowired CatalogSearchIndexWriter writer;
     @Autowired ObjectMapper objectMapper;
+    @Autowired ElasticsearchClient elasticsearch;
 
     @Test
     void prefixSearchUsesElasticsearchAndCombinesDatabaseStock() {
@@ -83,5 +86,21 @@ class CatalogSearchIntegrationTest {
         assertThat(current.getItems()).extracting(book -> book.getTitle())
                 .containsExactly("Versioned Search Title");
         assertThat(stale.getItems()).isEmpty();
+    }
+
+    @Test
+    void indexUsesPrefixAndBookIdSortOptimizations() throws Exception {
+        String index = "catalog-book-v1-000001";
+        var settings = elasticsearch.indices().getSettings(request -> request.index(index))
+                .get(index).settings().index();
+        var titlePrefix = elasticsearch.indices().getMapping(request -> request.index(index))
+                .get(index).mappings().properties().get("titlePrefix").text();
+
+        assertThat(settings.sort().field()).containsExactly("bookIdSort");
+        assertThat(settings.sort().order()).containsExactly(SegmentSortOrder.Asc);
+        assertThat(settings.refreshInterval().time()).isEqualTo("1s");
+        assertThat(titlePrefix.analyzer()).isEqualTo("keyword");
+        assertThat(titlePrefix.indexPrefixes().minChars()).isEqualTo(1);
+        assertThat(titlePrefix.indexPrefixes().maxChars()).isEqualTo(19);
     }
 }

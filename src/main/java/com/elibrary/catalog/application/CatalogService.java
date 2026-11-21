@@ -63,7 +63,6 @@ public class CatalogService {
     /**
      * 以稳定的书籍识别码进行寻址分页；第一页不传 afterBookId。
      */
-    @Transactional(readOnly = true)
     public BookDtos.BookPage browse(String query, Long categoryId, String language, String format,
                                     Long afterBookId, int size) {
         // 空查询代表不限制书名；非空查询去除首尾空白后交由 Mapper 筛选。
@@ -101,7 +100,7 @@ public class CatalogService {
                                            Long categoryId, String language, BookFormat format,
                                            long afterId, int size) {
         try {
-            var searchQuery = new BookSearchReader.BookSearchQuery(
+            var searchQuery = new BookSearchQuery(
                     query, categoryId, language, format, afterId);
             var matches = searchReader.search(searchQuery, size + 1);
             boolean hasMore = matches.size() > size;
@@ -109,22 +108,22 @@ public class CatalogService {
                 matches = matches.subList(0, size);
             }
 
-            var bookIds = matches.stream().map(BookSearchReader.BookSearchView::bookId).toList();
+            var bookIds = matches.stream().map(BookSearchView::getBookId).toList();
             var stocks = stockReader.findByBookIds(bookIds);
             var now = clock.now();
             var items = matches.stream().map(book -> {
-                var stock = stocks.get(book.bookId());
+                var stock = stocks.get(book.getBookId());
                 BookDtos.Availability availability = stock == null ? null
-                        : new BookDtos.Availability(stock.availableCopies(), stock.totalCopies(), now,
+                        : new BookDtos.Availability(stock.getAvailableCopies(), stock.getTotalCopies(), now,
                         BookDtos.AvailabilitySource.DATABASE);
-                return new BookDtos.BookResponse(Long.toUnsignedString(book.bookId()), book.isbn(), book.title(),
-                        book.subtitle(), book.authors(), book.publisher(),
-                        Long.toUnsignedString(book.categoryId()), book.language(), book.description(),
-                        book.coverUrl(), book.publishedDate(), book.format(), book.status(),
-                        book.version(), availability);
+                return new BookDtos.BookResponse(Long.toUnsignedString(book.getBookId()), book.getIsbn(),
+                        book.getTitle(), book.getSubtitle(), book.getAuthors(), book.getPublisher(),
+                        Long.toUnsignedString(book.getCategoryId()), book.getLanguage(), book.getDescription(),
+                        book.getCoverUrl(), book.getPublishedDate(), book.getFormat(), book.getStatus(),
+                        book.getVersion(), availability);
             }).toList();
             String nextBookId = hasMore
-                    ? Long.toUnsignedString(matches.getLast().bookId())
+                    ? Long.toUnsignedString(matches.getLast().getBookId())
                     : null;
             return new BookDtos.BookPage(items, nextBookId, hasMore);
         } catch (BookSearchUnavailableException exception) {

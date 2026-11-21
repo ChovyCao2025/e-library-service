@@ -1,7 +1,6 @@
 package com.elibrary.lending.application;
 
 import com.elibrary.lending.infrastructure.LendingMapper;
-import com.elibrary.lending.infrastructure.LendingStockRow;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -23,15 +22,8 @@ public class LendingStockReader {
             return Map.of();
         }
         return mapper.findStocks(bookIds).stream()
-                .map(StockSnapshot::from)
-                .collect(Collectors.toMap(StockSnapshot::bookId, Function.identity()));
-    }
-
-    /** 搜索结果组装所需的稳定库存值，不向 Catalog 暴露 Lending 持久化对象。 */
-    public record StockSnapshot(long bookId, int totalCopies, int availableCopies, long version) {
-        private static StockSnapshot from(LendingStockRow row) {
-            return new StockSnapshot(row.getBookId(), row.getTotalCopies(),
-                    row.getAvailableCopies(), row.getVersion());
-        }
+                .map(row -> new StockSnapshot(row.getBookId(), row.getTotalCopies(),
+                        row.getAvailableCopies(), row.getVersion()))
+                .collect(Collectors.toMap(StockSnapshot::getBookId, Function.identity()));
     }
 }

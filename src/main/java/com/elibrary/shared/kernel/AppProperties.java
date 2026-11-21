@@ -130,7 +130,7 @@ public class AppProperties {
         private static final String DEFAULT_READ_ALIAS = "catalog-book-read";
         private static final String DEFAULT_WRITE_ALIAS = "catalog-book-write";
         private static final String DEFAULT_CONSUMER_GROUP = "catalog-search-indexer";
-        private static final int DEFAULT_BATCH_SIZE = 500;
+        private static final int DEFAULT_BATCH_SIZE = 5_000;
         private static final Duration DEFAULT_POLL_INTERVAL = Duration.ofSeconds(1);
         private static final Duration DEFAULT_AWAIT_DURATION = Duration.ofSeconds(5);
         private static final Duration DEFAULT_INVISIBLE_DURATION = Duration.ofSeconds(30);

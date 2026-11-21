@@ -163,10 +163,16 @@ XXL-JOB 的 `outboxCompensationJob` 定期掃描到期的 `NEW` 事件與租約�
 Elasticsearch 文件只保存 Catalog 書目欄位。搜尋取得一頁書籍後，應用程式以一條
 `lending_stock WHERE book_id IN (...)` 查詢補上即時庫存，ES 不保存庫存事實。
 
+`titlePrefix` 使用 `keyword` analyzer 與 1–19 字元的 `index_prefixes`；全部條件在 filter
+context 執行。索引依 `bookIdSort ASC` 做 segment sorting，查詢關閉 total hits 統計並使用相同
+排序，使每個 segment 在取得本頁所需結果後可以提前終止。搜尋期間不持有 MySQL 交易連線，
+只有後續庫存批量查詢使用短只讀交易。
+
 索引使用 `catalog-book-v1-000001` 版本化實體名稱及 `catalog-book-read`、
 `catalog-book-write` 別名。首次啟用可由 MySQL 依 `book_id` 分批回填；後續
 `BookCreated/BookUpdated/BookPublished/BookOfflined` 經 Outbox 與 RocketMQ 投遞給搜尋
 消費者。寫入採 `aggregateVersion` 外部版本控制，重複事件可重放，較舊事件無法覆蓋較新文件。
+全量回填使用 5,000 筆批次，期間暫停自動 refresh，結束後恢復一秒 refresh 並主動刷新一次。
 
 搜尋開關預設關閉。開啟後，ES 故障回傳可重試的 `SEARCH_UNAVAILABLE`，保護已確認會在
 大資料量下超時的 MySQL 前綴查詢。普通瀏覽、詳情、借閱狀態終裁及所有寫入仍由 MySQL 提供。

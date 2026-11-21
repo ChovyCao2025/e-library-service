@@ -66,6 +66,17 @@ public class CatalogSearchIndexWriter {
         }
     }
 
+    public void setRefreshInterval(String interval) {
+        indexManager.ensureIndex();
+        try {
+            client.indices().putSettings(p -> p
+                    .index(properties.getSearch().getPhysicalIndex())
+                    .settings(s -> s.refreshInterval(t -> t.time(interval))));
+        } catch (IOException exception) {
+            throw new IllegalStateException("Unable to update catalog search refresh interval", exception);
+        }
+    }
+
     public void refresh() {
         try {
             client.indices().refresh(r -> r.index(properties.getSearch().getReadAlias()));

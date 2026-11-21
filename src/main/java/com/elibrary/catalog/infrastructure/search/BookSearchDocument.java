@@ -1,6 +1,6 @@
 package com.elibrary.catalog.infrastructure.search;
 
-import com.elibrary.catalog.application.BookSearchReader.BookSearchView;
+import com.elibrary.catalog.application.BookSearchView;
 import com.elibrary.catalog.domain.BookFormat;
 import com.elibrary.catalog.domain.BookStatus;
 import com.elibrary.catalog.infrastructure.BookRow;
@@ -12,6 +12,7 @@ import org.springframework.data.annotation.Id;
 import org.springframework.data.elasticsearch.annotations.Document;
 import org.springframework.data.elasticsearch.annotations.Field;
 import org.springframework.data.elasticsearch.annotations.FieldType;
+import org.springframework.data.elasticsearch.annotations.IndexPrefixes;
 import org.springframework.data.elasticsearch.annotations.WriteTypeHint;
 import tools.jackson.core.JacksonException;
 import tools.jackson.core.type.TypeReference;
@@ -42,7 +43,8 @@ public class BookSearchDocument {
     @Field(type = FieldType.Text)
     private String title;
 
-    @Field(type = FieldType.Keyword)
+    @Field(type = FieldType.Text, analyzer = "keyword", searchAnalyzer = "keyword", norms = false,
+            indexPrefixes = @IndexPrefixes(minChars = 1, maxChars = 19))
     private String titlePrefix;
 
     @Field(type = FieldType.Text)

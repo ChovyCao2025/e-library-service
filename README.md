@@ -196,6 +196,7 @@ X-Role: ADMIN
 | `SEARCH_ENABLED` | `false` | 將帶 `q` 的書目搜尋切換至 Elasticsearch |
 | `SEARCH_REBUILD_ON_STARTUP` | `false` | 啟動時以 MySQL 全量回填版本化索引 |
 | `SEARCH_CONSUMER_ENABLED` | `false` | 消費 Catalog MQ 事件並持續更新搜尋投影 |
+| `SEARCH_BATCH_SIZE` | `5000` | 首次全量回填每批處理的書目數量 |
 | `ELASTICSEARCH_URIS` | `http://localhost:9200` | Elasticsearch 節點位址 |
 | `XXL_JOB_ENABLED` | `false` | 啟用 Outbox 補償執行器 |
 | `XXL_JOB_ADMIN_ADDRESSES` | 本機 `8088` | XXL-JOB 調度中心位址 |

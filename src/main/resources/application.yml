@@ -68,7 +68,7 @@ app:
     read-alias: ${SEARCH_READ_ALIAS:catalog-book-read}
     write-alias: ${SEARCH_WRITE_ALIAS:catalog-book-write}
     consumer-group: ${SEARCH_CONSUMER_GROUP:catalog-search-indexer}
-    batch-size: ${SEARCH_BATCH_SIZE:500}
+    batch-size: ${SEARCH_BATCH_SIZE:5000}
     poll-interval: ${SEARCH_POLL_INTERVAL:1s}
     await-duration: ${SEARCH_AWAIT_DURATION:5s}
     invisible-duration: ${SEARCH_INVISIBLE_DURATION:30s}
